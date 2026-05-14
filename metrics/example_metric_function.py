@@ -1,89 +1,58 @@
-#!/usr/bin/env python3
 """
-Example metric functions for NA6P optimization.
-Replace these with your actual metric calculations.
+Example of metric function for NA6P parameter optimization.
+
+This module is loaded by optimize_reco_params.py to evaluate parameter sets.
+Replace the implementation below with your actual reconstruction quality metric.
+
+The metric_function should:
+  - Take an output_dir (string) containing reconstruction results
+  - Parse the output files (e.g., ROOT files, text logs)
+  - Calculate a single float value representing quality
+  - Return a value to MAXIMIZE
+
+Common metrics:
+  - Chi-squared from fits
+  - Inverse of efficiency (1 - efficiency)
+  - Resolution values
+  - Composite scores (efficiency + resolution trade-offs)
 """
 
+import uproot
 from pathlib import Path
-import numpy as np
 
 
-def metric_from_root_file(output_dir: str) -> float:
+def metric_function(output_dir: str) -> float:
     """
-    Example: Extract metric from ROOT file output.
+    Calculate reconstruction quality metric.
     
-    You'll need to install uproot: pip install uproot awkward
-    """
-    try:
-        import uproot
-    except ImportError:
-        raise ImportError("Install uproot: pip install uproot awkward")
-    
-    output_dir = Path(output_dir)
-    
-    # Example: Find ROOT file in output directory
-    root_files = list(output_dir.glob("*.root"))
-    if not root_files:
-        raise FileNotFoundError(f"No ROOT files found in {output_dir}")
-    
-    root_file = root_files[0]
-    
-    # Open ROOT file and extract metrics
-    with uproot.open(root_file) as f:
-        # Example: Get a tree and calculate efficiency
-        # tree = f["YourTreeName"]
-        # data = tree.arrays(["variable1", "variable2"], library="np")
+    Args:
+        output_dir: Path to directory containing na6prec output files
         
-        # Calculate your metric (e.g., 1/efficiency to minimize)
-        # efficiency = calculate_efficiency(data)
-        # metric = 1.0 / efficiency
-        
-        pass
-    
-    # Placeholder
-    return 1.0
-
-
-def metric_from_text_output(output_dir: str) -> float:
+    Returns:
+        Float value to MAXIMIZE
     """
-    Example: Parse text output to extract metric.
-    """
-    output_dir = Path(output_dir)
-    
-    # Example: Parse log file
-    log_files = list(output_dir.glob("*.log"))
-    if log_files:
-        with open(log_files[0], 'r') as f:
-            content = f.read()
-            
-            # Parse metric from log
-            # Example: search for "Chi2/NDF = X.XXX"
-            # import re
-            # match = re.search(r'Chi2/NDF\s*=\s*([0-9.]+)', content)
-            # if match:
-            #     return float(match.group(1))
-            
-            pass
-    
-    # Placeholder
-    return 1.0
+    track_file = "TracksMuonSpec.root"
+    output_path = Path(output_dir)
 
+    track_path = output_path / track_file
+    if not track_path.exists():
+        raise FileNotFoundError(f"Track file not found: {track_path}")
 
-def combined_metric(output_dir: str) -> float:
-    """
-    Example: Combine multiple metrics with weights.
-    """
-    # Calculate individual metrics
-    # efficiency = calculate_efficiency(output_dir)
-    # resolution = calculate_resolution(output_dir)
-    # purity = calculate_purity(output_dir)
+    file = uproot.open(track_path)
+    tree = file["tracksMuonSpec"]
     
-    # Combine with weights (minimize this)
-    # metric = (
-    #     1.0 / efficiency +        # Want high efficiency
-    #     resolution +               # Want low resolution
-    #     (1.0 - purity)            # Want high purity
-    # )
+    # Read mass data - this is a jagged array where each entry corresponds to one event
+    # and contains an array of mass values (one per track in that event)
+    mass_data = tree["MuonSpec.mMass"].array()
     
-    # Placeholder
-    return 1.0
+    # Count total number of tracks across ALL events
+    # awkward.sum() flattens the jagged structure and counts all elements
+    import awkward as ak
+    n_tracks = ak.sum(ak.num(mass_data))
+    
+    print(f"Number of events: {len(mass_data)}")
+    print(f"Total number of tracks across all events: {n_tracks}")
+
+    # TODO: Replace with your actual metric calculation
+    
+    return float(n_tracks)

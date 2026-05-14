@@ -12,7 +12,6 @@ A flexible Python framework for optimizing NA6P reconstruction parameters using 
 - [Adding Custom Metrics](#adding-custom-metrics)
 - [Adding Parameters](#adding-parameters)
 - [Advanced Usage](#advanced-usage)
-- [Troubleshooting](#troubleshooting)
 - [Examples](#examples)
 
 ---
@@ -58,7 +57,7 @@ pip install uproot awkward
 
 ```bash
 # Clone or copy the optimization scripts
-chmod +x optimize_na6p.py
+chmod +x optimize_reco_params.py
 ```
 
 ---
@@ -73,35 +72,48 @@ Ensure you have:
 
 ### 2. Define Your Metric
 
-Edit `optimize_na6p.py` and replace `example_metric_function` with your actual metric calculation:
+Create a `metric.py` file (or point to your custom metric module with `--metric-module`):
 
 ```python
-def my_metric_function(output_dir: str) -> float:
+# metric.py
+def metric_function(output_dir: str) -> float:
     """Calculate reconstruction quality metric."""
     # Read output files from output_dir
     # Calculate metric (e.g., chi2, efficiency, resolution)
-    # Return value to MINIMIZE
+    # Return value to MAXIMIZE
     return metric_value
 ```
 
+Common approaches:
+- Parse ROOT files with `uproot` and calculate efficiency or resolution
+- Parse reconstruction logs for chi-squared values
+- Combine multiple metrics (efficiency + resolution trade-off)
+
 ### 3. Define Parameters to Optimize
 
-In the `main()` function, edit `param_ranges`:
+Create a `param_ranges.json` file in the project root, then point the script to it with `--param-ranges`:
 
-```python
-param_ranges = {
-    'vertexerMaxDeltaThetaTracklet': (0.3, 1.0, 'float'),
-    'vertexerKDEBandwidth': (0.1, 1.0, 'float'),
-    # Add more parameters here
+```json
+{
+    "parameters": {
+        "vertexerMaxDeltaThetaTracklet": {"min": 0.3, "max": 1.0, "type": "float"},
+        "vertexerKDEBandwidth": {"min": 0.1, "max": 1.0, "type": "float"},
+        "vtNIterationsTrackerCA": {"min": 1, "max": 4, "type": "int"},
+        "vtMaxDeltaThetaTrackletsCA": {"min": 0.02, "max": 0.1, "type": "float", "iterations_param": "vtNIterationsTrackerCA"}
+    }
 }
 ```
+
+Parameters with `iterations_param` are expanded automatically as indexed values like `vtMaxDeltaThetaTrackletsCA[0]`, `vtMaxDeltaThetaTrackletsCA[1]`, and so on, using the sampled count from `vtNIterationsTrackerCA`.
 
 ### 4. Run Optimization
 
 ```bash
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini na6pLayout_Jelle.ini \
     --reco-ini na6pRecoParam.ini \
+    --metric-module metrics/example_metric_function.py \
+    --param-ranges params/param_ranges.json \
     --n-trials 50 \
     --work-dir ./optimization_work
 ```
@@ -178,35 +190,35 @@ Optuna uses **Tree-structured Parzen Estimator (TPE)** by default, which:
 ### Command-Line Arguments
 
 ```bash
-./optimize_na6p.py [OPTIONS]
+./optimize_reco_params.py [OPTIONS]
 ```
 
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--layout-ini` | Path to layout INI file | **Required** |
 | `--reco-ini` | Path to reconstruction parameter template | **Required** |
-| `--n-trials` | Number of optimization trials | 100 |
-| `--n-sim` | Number of simulation events | 50000 |
-| `--n-rec` | Number of reconstruction events | 50000 |
+| `--n-trials` | Number of optimization trials | 10 |
+| `--n-events` | Number of simulation/reconstruction events | 100 |
 | `--work-dir` | Working directory for trials | `./optimization_work` |
 | `--study-name` | Optuna study name | `na6p_optimization` |
+| `--param-ranges` | Parameter ranges config file | `params/param_ranges.json` |
+| `--metric-module` | Python module defining `metric_function` | `metrics/example_metric_function.py` |
 | `--storage` | Database URL for persistent storage | None (in-memory) |
 
 ### Example Configurations
 
 **Quick test run:**
 ```bash
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini layout.ini \
     --reco-ini reco.ini \
     --n-trials 10 \
-    --n-sim 5000 \
-    --n-rec 5000
+    --n-events 5000
 ```
 
 **Production run with persistence:**
 ```bash
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini layout.ini \
     --reco-ini reco.ini \
     --n-trials 200 \
@@ -216,7 +228,7 @@ Optuna uses **Tree-structured Parzen Estimator (TPE)** by default, which:
 **Resume interrupted optimization:**
 ```bash
 # Same command as before - Optuna will load existing trials
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini layout.ini \
     --reco-ini reco.ini \
     --n-trials 200 \
@@ -241,7 +253,7 @@ def your_metric_function(output_dir: str) -> float:
         output_dir: Directory containing na6prec output files
         
     Returns:
-        Float value to MINIMIZE (lower = better)
+        Float value to MAXIMIZE (higher = better)
     """
     # Your implementation here
     return metric_value
@@ -271,15 +283,15 @@ def efficiency_metric(output_dir: str) -> float:
         
         efficiency = n_reco / n_true
         
-        # Return 1/efficiency to minimize (maximize efficiency)
-        return 1.0 / efficiency if efficiency > 0 else 1e10
+        # Return efficiency directly (maximize efficiency)
+        return efficiency
 ```
 
 ### Example 2: Resolution-Based Metric
 
 ```python
 def resolution_metric(output_dir: str) -> float:
-    """Minimize momentum resolution."""
+    """Maximize (negative) momentum resolution."""
     import uproot
     import numpy as np
     from pathlib import Path
@@ -299,7 +311,7 @@ def resolution_metric(output_dir: str) -> float:
         delta_p = np.abs(p_reco - p_true) / p_true
         resolution = np.mean(delta_p)
         
-        return resolution  # Already want to minimize
+        return -resolution  # Maximize negative resolution == minimize resolution
 ```
 
 ### Example 3: Combined Metric
@@ -369,7 +381,7 @@ def chi2_from_log(output_dir: str) -> float:
 ### Tips for Writing Metrics
 
 1. **Always return a float** - Optuna needs a single number
-2. **Lower is better** - Optuna minimizes by default
+2. **Higher is better** - Optuna set to maximize
 3. **Handle failures gracefully** - Return a large penalty value (e.g., `1e10`) if analysis fails
 4. **Normalize different scales** - If combining metrics, scale them appropriately
 5. **Consider adding constraints** - Return penalty if parameters violate physics constraints
@@ -380,11 +392,13 @@ def chi2_from_log(output_dir: str) -> float:
 
 ### Parameter Format
 
-Parameters are defined in the `param_ranges` dictionary:
+Parameters are defined in `params/param_ranges.json` under the `parameters` object:
 
-```python
-param_ranges = {
-    'parameter_name': (min_value, max_value, type),
+```json
+{
+    "parameters": {
+        "parameter_name": {"min": 0.1, "max": 1.0, "type": "float"}
+    }
 }
 ```
 
@@ -392,6 +406,8 @@ param_ranges = {
 - `'float'` - Continuous decimal values
 - `'int'` - Integer values
 - `'log'` - Log-scale floats (for parameters spanning orders of magnitude)
+
+For compatibility with the current script, encode these ranges in `params/param_ranges.json` using the JSON object format shown above.
 
 ### Example: Simple Parameters
 
@@ -492,7 +508,7 @@ Optuna supports parallel trials when using a database backend:
 
 **Terminal 1:**
 ```bash
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini layout.ini \
     --reco-ini reco.ini \
     --n-trials 50 \
@@ -503,7 +519,7 @@ Optuna supports parallel trials when using a database backend:
 
 **Terminal 2:**
 ```bash
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini layout.ini \
     --reco-ini reco.ini \
     --n-trials 50 \
@@ -526,12 +542,12 @@ def multi_objective(trial, param_ranges):
     efficiency = calculate_efficiency(trial_dir)
     resolution = calculate_resolution(trial_dir)
     
-    # Return tuple of values to minimize
+    # Return tuple of values to maximize
     return (1.0 / efficiency, resolution)
 
 # Create multi-objective study
 study = optuna.create_study(
-    directions=['minimize', 'minimize'],  # Two objectives
+    directions=['maximize', 'maximize'],  # Two objectives
     study_name="multi_obj"
 )
 
@@ -649,134 +665,36 @@ vis.plot_optimization_history(study).show()
 
 ---
 
-## Troubleshooting
-
-### Problem: Simulation fails
-
-**Symptoms:**
-```
-RuntimeError: Simulation failed:
-ERROR: ...
-```
-
-**Solutions:**
-1. Check that `$NA6PROOT_ROOT` is set correctly
-2. Verify `na6psim` is in PATH: `which na6psim`
-3. Check that layout INI file exists and is valid
-4. Try running simulation manually to see full error
-
-### Problem: All trials fail
-
-**Symptoms:**
-```
-optuna.TrialPruned() raised for all trials
-```
-
-**Solutions:**
-1. Check that `na6prec` command is correct
-2. Verify reconstruction runs manually
-3. Check that parameter ranges are physically reasonable
-4. Add debug prints in `run_reconstruction()` method
-
-### Problem: Metric returns NaN or inf
-
-**Symptoms:**
-```
-Trial failed with value: nan
-```
-
-**Solutions:**
-1. Add validation in metric function:
-```python
-def safe_metric(output_dir):
-    try:
-        metric = calculate_metric(output_dir)
-        if np.isnan(metric) or np.isinf(metric):
-            return 1e10  # Penalty
-        return metric
-    except Exception as e:
-        print(f"Metric calculation failed: {e}")
-        return 1e10
-```
-
-### Problem: Optimization stuck in local minimum
-
-**Solutions:**
-1. Increase number of trials
-2. Widen parameter ranges
-3. Use different sampler:
-```python
-study = optuna.create_study(
-    sampler=optuna.samplers.RandomSampler()  # More exploration
-)
-```
-4. Run multiple independent studies and compare
-
-### Problem: Too slow
-
-**Solutions:**
-1. Reduce `n_sim` and `n_rec` for faster trials
-2. Use parallel optimization (see Advanced Usage)
-3. Enable pruning to stop bad trials early
-4. Optimize fewer parameters at once
-5. Start with coarse grid, then refine
-
-### Problem: Can't resume optimization
-
-**Error:**
-```
-Study 'my_study' not found
-```
-
-**Solution:**
-Ensure you use the same `--storage` and `--study-name`:
-```bash
-# First run
-./optimize_na6p.py --storage sqlite:///db.db --study-name my_study ...
-
-# Resume (same storage and name!)
-./optimize_na6p.py --storage sqlite:///db.db --study-name my_study ...
-```
-
----
-
 ## Examples
 
 ### Example 1: Quick Test Run
 
 ```bash
 # Test with minimal trials
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini test_layout.ini \
     --reco-ini test_reco.ini \
     --n-trials 5 \
-    --n-sim 1000 \
-    --n-rec 1000 \
+    --n-events 1000 \
     --work-dir ./quick_test
 ```
 
 ### Example 2: Optimize Vertexer Parameters
 
-```python
-# In optimize_na6p.py, modify param_ranges:
-param_ranges = {
-    # Tracklet finding
-    'vertexerMaxDeltaThetaTracklet': (0.3, 1.0, 'float'),
-    'vertexerMaxDeltaPhiTracklet': (0.01, 0.1, 'float'),
-    'vertexerMaxDeltaTanLamInOut': (0.5, 2.0, 'float'),
-    
-    # DCA cuts
-    'vertexerMaxDCAxy': (0.1, 0.5, 'float'),
-    
-    # Peak finding
-    'vertexerKDEBandwidth': (0.1, 2.0, 'float'),
-    'vertexerZWindowWidth': (0.5, 3.0, 'float'),
-    'vertexerMinCountsInPeak': (1, 10, 'int'),
+```json
+{
+    "vertexerMaxDeltaThetaTracklet": {"min": 0.3, "max": 1.0, "type": "float"},
+    "vertexerMaxDeltaPhiTracklet": {"min": 0.01, "max": 0.1, "type": "float"},
+    "vertexerMaxDeltaTanLamInOut": {"min": 0.5, "max": 2.0, "type": "float"},
+    "vertexerMaxDCAxy": {"min": 0.1, "max": 0.5, "type": "float"},
+    "vertexerKDEBandwidth": {"min": 0.1, "max": 2.0, "type": "float"},
+    "vertexerZWindowWidth": {"min": 0.5, "max": 3.0, "type": "float"},
+    "vertexerMinCountsInPeak": {"min": 1, "max": 10, "type": "int"}
 }
 ```
 
 ```bash
-./optimize_na6p.py \
+./optimize_reco_params.py \
     --layout-ini layout.ini \
     --reco-ini reco.ini \
     --n-trials 100 \
@@ -786,21 +704,15 @@ param_ranges = {
 
 ### Example 3: Optimize Tracker Parameters
 
-```python
-param_ranges = {
-    # VT Tracker - First iteration
-    'vtMaxDeltaThetaTrackletsCA[0]': (0.02, 0.08, 'float'),
-    'vtMaxDeltaPhiTrackletsCA[0]': (0.05, 0.15, 'float'),
-    'vtMaxDeltaTanLCellsCA[0]': (2, 8, 'int'),
-    'vtMaxDeltaPhiCellsCA[0]': (0.2, 0.6, 'float'),
-    
-    # VT Tracker - Second iteration
-    'vtMaxDeltaThetaTrackletsCA[1]': (0.05, 0.15, 'float'),
-    'vtMaxDeltaPhiTrackletsCA[1]': (0.1, 0.3, 'float'),
-    
-    # Chi2 cuts
-    'vtMaxChi2ndfCellsCA[0]': (50, 200, 'float'),
-    'vtMaxChi2ndfTracksCA[0]': (50, 200, 'float'),
+```json
+{
+    "parameters": {
+        "vtNIterationsTrackerCA": {"min": 1, "max": 4, "type": "int"},
+        "vtMaxDeltaThetaTrackletsCA": {"min": 0.02, "max": 0.08, "type": "float", "iterations_param": "vtNIterationsTrackerCA"},
+        "vtMaxDeltaPhiTrackletsCA": {"min": 0.05, "max": 0.15, "type": "float", "iterations_param": "vtNIterationsTrackerCA"},
+        "vtMaxDeltaTanLCellsCA": {"min": 2, "max": 8, "type": "int", "iterations_param": "vtNIterationsTrackerCA"},
+        "vtMaxDeltaPhiCellsCA": {"min": 0.2, "max": 0.6, "type": "float", "iterations_param": "vtNIterationsTrackerCA"}
+    }
 }
 ```
 
@@ -808,9 +720,9 @@ param_ranges = {
 
 ```bash
 # Stage 1: Coarse search with wide ranges
-./optimize_na6p.py \
-    --layout-ini layout.ini \
-    --reco-ini reco.ini \
+./optimize_reco_params.py \
+    --layout-ini na6pLayout_Jelle.ini \
+    --reco-ini na6pRecoParam.ini \
     --n-trials 50 \
     --work-dir ./stage1
 
@@ -818,9 +730,9 @@ param_ranges = {
 # Edit param_ranges to narrow around best values
 
 # Stage 2: Fine search with narrow ranges
-./optimize_na6p.py \
-    --layout-ini layout.ini \
-    --reco-ini reco.ini \
+./optimize_reco_params.py \
+    --layout-ini na6pLayout_Jelle.ini \
+    --reco-ini na6pRecoParam.ini \
     --n-trials 100 \
     --work-dir ./stage2
 ```
@@ -875,7 +787,7 @@ After running optimization, your directory will look like:
 
 ```
 project/
-├── optimize_na6p.py           # Main optimization script
+├── optimize_reco_params.py           # Main optimization script
 ├── metric_examples.py          # Example metric functions
 ├── README.md                   # This file
 ├── na6pLayout_Jelle.ini       # Your layout config
@@ -947,17 +859,3 @@ To extend this framework:
 - [Optuna Tutorial](https://optuna.readthedocs.io/en/stable/tutorial/index.html)
 - [Hyperparameter Optimization](https://en.wikipedia.org/wiki/Hyperparameter_optimization)
 
----
-
-## License
-
-This optimization framework is provided as-is for use with NA6P reconstruction software.
-
----
-
-## Support
-
-For issues or questions:
-1. Check the [Troubleshooting](#troubleshooting) section
-2. Review the [Examples](#examples)
-3. Consult Optuna documentation for algorithm-specific questions

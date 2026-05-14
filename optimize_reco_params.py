@@ -3,380 +3,449 @@
 Parameter optimization script for NA6P reconstruction using Optuna.
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.fixes")
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*pkg_resources.*")
+warnings.filterwarnings("ignore", message=".*is experimental.*")
+
 import argparse
+import importlib.util
+import json
 import os
+import re
 import subprocess
-import shutil
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Callable
+from typing import Any, Callable, Dict
+
 import optuna
 from optuna.trial import Trial
-import re
+
+
+def load_metric_function(module_path: str) -> Callable[[str], float]:
+    """Dynamically load a metric function from a Python module.
+    
+    Args:
+        module_path: Path to Python file containing a 'metric_function' callable
+        
+    Returns:
+        The loaded metric function
+        
+    Raises:
+        FileNotFoundError: If the module path doesn't exist
+        AttributeError: If the module doesn't define 'metric_function'
+    """
+    path = Path(module_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Metric module not found: {path}")
+    
+    spec = importlib.util.spec_from_file_location("metric_module", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {path}")
+    
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["metric_module"] = module
+    spec.loader.exec_module(module)
+    
+    if not hasattr(module, "metric_function"):
+        raise AttributeError(
+            f"Module {path} must define a 'metric_function(output_dir: str) -> float' function"
+        )
+    
+    func = getattr(module, "metric_function")
+    if not callable(func):
+        raise TypeError(f"'metric_function' in {path} must be callable")
+    
+    return func
+
+
+
+def load_param_ranges(config_path: str) -> Dict[str, Any]:
+    """Load optimization parameter configuration from a JSON or JSON5 file."""
+    path = Path(config_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Parameter ranges file not found: {path}")
+
+    if path.suffix.lower() == ".json5":
+        try:
+            import json5
+        except ImportError as exc:
+            raise ImportError(
+                "Loading .json5 files requires the optional 'json5' package. "
+                "Install it with: pip install json5"
+            ) from exc
+
+        with open(path, "r", encoding="utf-8") as file_handle:
+            data = json5.load(file_handle)
+    else:
+        with open(path, "r", encoding="utf-8") as file_handle:
+            data = json.load(file_handle)
+
+    if not isinstance(data, dict):
+        raise ValueError("Parameter ranges file must contain a JSON object at the top level")
+
+    parameters = data.get("parameters", data)
+    if not isinstance(parameters, dict):
+        raise ValueError("The 'parameters' section must be a JSON object")
+
+    normalized: Dict[str, Any] = {"scalar": {}, "iterated": {}}
+    for param_name, spec in parameters.items():
+        normalized_spec = _normalize_param_spec(param_name, spec)
+        if "iterations_param" in normalized_spec or "iterations" in normalized_spec:
+            normalized["iterated"][str(param_name)] = normalized_spec
+        else:
+            normalized["scalar"][str(param_name)] = normalized_spec
+
+    return normalized
+
+
+def _normalize_param_spec(param_name: str, spec: Any) -> Dict[str, Any]:
+    """Normalize a parameter spec from JSON/JSON5 into a dictionary."""
+    if isinstance(spec, dict):
+        if {"min", "max", "type"}.issubset(spec):
+            normalized_spec = {
+                "min": spec["min"],
+                "max": spec["max"],
+                "type": str(spec["type"]),
+            }
+            if "iterations_param" in spec:
+                normalized_spec["iterations_param"] = str(spec["iterations_param"])
+            if "iterations" in spec:
+                normalized_spec["iterations"] = spec["iterations"]
+            return normalized_spec
+
+        raise ValueError(
+            f"Parameter '{param_name}' must define 'min', 'max', and 'type'"
+        )
+
+    if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        min_value, max_value, param_type = spec
+        return {
+            "min": min_value,
+            "max": max_value,
+            "type": str(param_type),
+        }
+
+    raise ValueError(
+        f"Parameter '{param_name}' must be either an object with min/max/type or a 3-item array"
+    )
 
 
 class INIParameterOptimizer:
     """Optimizer for NA6P reconstruction parameters."""
-    
+
     def __init__(
         self,
         layout_ini: str,
         reco_ini_template: str,
         metric_function: Callable[[str], float],
-        n_sim_events: int = 50000,
-        n_rec_events: int = 50000,
-        work_dir: str = "./optimization_work"
+        n_events: int = 50000,
+        work_dir: str = "./optimization_work",
     ):
-        """
-        Initialize the optimizer.
-        
-        Args:
-            layout_ini: Path to layout ini file
-            reco_ini_template: Path to template reco parameter ini file
-            metric_function: Function that takes output directory and returns metric to MINIMIZE
-            n_sim_events: Number of simulation events
-            n_rec_events: Number of reconstruction events
-            work_dir: Working directory for optimization trials
-        """
         self.layout_ini = Path(layout_ini).resolve()
         self.reco_ini_template = Path(reco_ini_template).resolve()
         self.metric_function = metric_function
-        self.n_sim_events = n_sim_events
-        self.n_rec_events = n_rec_events
-        self.work_dir = Path(work_dir)
-        self.work_dir.mkdir(exist_ok=True)
-        
-        # Check if simulation needs to be run
+        self.n_events = n_events
+        self.work_dir = Path(work_dir).expanduser().resolve()
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         self.sim_done = False
-        
-        # Verify required files exist
+
         if not self.layout_ini.exists():
             raise FileNotFoundError(f"Layout INI not found: {self.layout_ini}")
         if not self.reco_ini_template.exists():
             raise FileNotFoundError(f"Reco INI template not found: {self.reco_ini_template}")
-    
+
     def run_simulation(self):
         """Run na6psim once (only needs to be done once)."""
         if self.sim_done:
             return
-        
+
         print("Running simulation (na6psim)...")
+        generator_macro = os.path.expandvars(
+            '$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,"Omega")'
+        )
         cmd = [
             "na6psim",
-            f"-n{self.n_sim_events}",
-            "-g", f"$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")",
-            "--load-ini", str(self.layout_ini)
+            f"-n{self.n_events}",
+            "-g",
+            generator_macro,
+            "--load-ini",
+            str(self.layout_ini),
         ]
-        
-        # Execute with shell to expand environment variables
-        cmd_str = " ".join(cmd)
-        result = subprocess.run(
-            cmd_str,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=self.work_dir
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"Simulation failed:\n{result.stderr}")
-        
-        print("Simulation completed successfully")
-        self.sim_done = True
-    
-    def update_ini_file(self, params: Dict[str, float], output_path: Path):
-        """
-        Update INI file with new parameter values.
-        
-        Args:
-            params: Dictionary of parameter_name -> value
-            output_path: Where to write the modified INI file
-        """
-        with open(self.reco_ini_template, 'r') as f:
-            lines = f.readlines()
-        
-        updated_lines = []
-        for line in lines:
-            modified = False
-            for param_name, param_value in params.items():
-                # Match parameter lines (handle both simple and array parameters)
-                pattern = rf'^({re.escape(param_name)}(?:\[\d+\])?)\s*='
-                if re.match(pattern, line.strip()):
-                    # Extract the parameter name including array index if present
-                    match = re.match(pattern, line.strip())
-                    if match:
-                        param_full = match.group(1)
-                        updated_lines.append(f"{param_full}={param_value}\n")
-                        modified = True
-                        break
-            
-            if not modified:
-                updated_lines.append(line)
-        
-        with open(output_path, 'w') as f:
-            f.writelines(updated_lines)
-    
-    def run_reconstruction(self, reco_ini: Path, trial_dir: Path) -> float:
-        """
-        Run reconstruction with given parameters.
-        
-        Args:
-            reco_ini: Path to reconstruction INI file
-            trial_dir: Directory for this trial's output
-            
-        Returns:
-            Metric value (to be minimized)
-        """
-        print(f"Running reconstruction in {trial_dir}...")
-        
-        cmd = [
-            "na6prec",
-            f"-l{self.n_rec_events}",
-            "--load-recoparam", str(reco_ini),
-            "--load-ini", str(self.layout_ini),
-            "--doMatching", "false",
-            "--doHitsToRecPoints", "true",
-            "--doTrackletVertex", "false",
-            "--doVTTracking", "false"
-        ]
-        
+        print(f"Executing command: {' '.join(cmd)}")
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            cwd=trial_dir
+            cwd=self.work_dir,
         )
-        
+
         if result.returncode != 0:
-            print(f"Reconstruction failed:\n{result.stderr}")
+            raise RuntimeError(f"Simulation failed:\n{result.stderr}")
+
+        print("Simulation completed successfully")
+        self.sim_done = True
+
+    def _suggest_param_value(self, trial: Trial, param_name: str, spec: Dict[str, Any]) -> Any:
+        min_value = spec["min"]
+        max_value = spec["max"]
+        param_type = str(spec["type"]).lower()
+
+        if param_type == "float":
+            return trial.suggest_float(param_name, float(min_value), float(max_value))
+        if param_type == "int":
+            return trial.suggest_int(param_name, int(min_value), int(max_value))
+        if param_type == "log":
+            return trial.suggest_float(param_name, float(min_value), float(max_value), log=True)
+
+        raise ValueError(f"Unknown parameter type for '{param_name}': {param_type}")
+
+    def update_ini_file(self, params: Dict[str, Any], output_path: Path):
+        """Update INI file with new parameter values."""
+        with open(self.reco_ini_template, "r", encoding="utf-8") as file_handle:
+            lines = file_handle.readlines()
+
+        updated_lines = []
+        for line in lines:
+            stripped_line = line.strip()
+            modified = False
+
+            for param_name, param_value in params.items():
+                pattern = rf"^({re.escape(param_name)}(?:\[\d+\])?)\s*="
+                match = re.match(pattern, stripped_line)
+                if match:
+                    updated_lines.append(f"{match.group(1)}={param_value}\n")
+                    modified = True
+                    break
+
+            if not modified:
+                updated_lines.append(line)
+
+        with open(output_path, "w", encoding="utf-8") as file_handle:
+            file_handle.writelines(updated_lines)
+
+    def run_reconstruction(self, reco_ini: Path, trial_dir: Path) -> float:
+        """Run reconstruction with given parameters."""
+        print(f"Running reconstruction in {trial_dir}...")
+
+        reco_ini_path = Path(reco_ini).resolve()
+        layout_ini_path = self.layout_ini.resolve()
+        staged_reco_ini_path = (self.work_dir / "reco_params.ini").resolve()
+        staged_reco_ini_path.write_text(reco_ini_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        cmd = [
+            "na6prec",
+            f"-l{self.n_events}",
+            "--load-recoparam",
+            str(staged_reco_ini_path),
+            "--load-ini",
+            str(layout_ini_path),
+            "--doMatching",
+            "false",
+            "--doHitsToRecPoints",
+            "true",
+            "--doTrackletVertex",
+            "false",
+            "--doVTTracking",
+            "false",
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=self.work_dir,
+        )
+
+        if result.returncode != 0:
+            if result.stdout:
+                print(f"Reconstruction output:\n{result.stdout}")
+            if result.stderr:
+                print(f"Reconstruction failed:\n{result.stderr}")
+            else:
+                print("Reconstruction failed with no stderr output.")
             raise optuna.TrialPruned()
-        
-        # Calculate metric
-        metric = self.metric_function(str(trial_dir))
+
+        metric = self.metric_function(str(self.work_dir))
         print(f"Metric value: {metric}")
-        
         return metric
-    
-    def objective(
-        self,
-        trial: Trial,
-        param_ranges: Dict[str, Tuple[float, float, str]]
-    ) -> float:
-        """
-        Objective function for Optuna.
-        
-        Args:
-            trial: Optuna trial object
-            param_ranges: Dict of param_name -> (min, max, type)
-                         where type is 'float', 'int', or 'log'
-        
-        Returns:
-            Metric value to minimize
-        """
-        # Create trial directory
+
+    def objective(self, trial: Trial, param_config: Dict[str, Any]) -> float:
+        """Objective function for Optuna."""
         trial_dir = self.work_dir / f"trial_{trial.number}"
         trial_dir.mkdir(exist_ok=True)
-        
-        # Suggest parameters
-        params = {}
-        for param_name, (min_val, max_val, param_type) in param_ranges.items():
-            if param_type == 'float':
-                params[param_name] = trial.suggest_float(param_name, min_val, max_val)
-            elif param_type == 'int':
-                params[param_name] = trial.suggest_int(param_name, int(min_val), int(max_val))
-            elif param_type == 'log':
-                params[param_name] = trial.suggest_float(param_name, min_val, max_val, log=True)
+
+        params: Dict[str, Any] = {}
+        scalar_params = param_config.get("scalar", {})
+        iterated_params = param_config.get("iterated", {})
+
+        for param_name, spec in scalar_params.items():
+            params[param_name] = self._suggest_param_value(trial, param_name, spec)
+
+        for param_name, spec in iterated_params.items():
+            if "iterations_param" in spec:
+                iterations_param = spec["iterations_param"]
+                if iterations_param not in params:
+                    raise ValueError(
+                        f"Iterated parameter '{param_name}' depends on missing count parameter '{iterations_param}'"
+                    )
+                iteration_count = int(params[iterations_param])
+            elif "iterations" in spec:
+                iteration_count = int(spec["iterations"])
             else:
-                raise ValueError(f"Unknown parameter type: {param_type}")
-        
-        # Create modified INI file
+                raise ValueError(
+                    f"Iterated parameter '{param_name}' must define either 'iterations_param' or 'iterations'"
+                )
+
+            if iteration_count < 0:
+                raise ValueError(f"Iteration count for '{param_name}' must be non-negative")
+
+            for index in range(iteration_count):
+                indexed_name = f"{param_name}[{index}]"
+                params[indexed_name] = self._suggest_param_value(trial, indexed_name, spec)
+
         trial_reco_ini = trial_dir / "reco_params.ini"
         self.update_ini_file(params, trial_reco_ini)
-        
-        # Run reconstruction and get metric
-        metric = self.run_reconstruction(trial_reco_ini, trial_dir)
-        
-        return metric
-    
+
+        return self.run_reconstruction(trial_reco_ini, trial_dir)
+
     def optimize(
         self,
-        param_ranges: Dict[str, Tuple[float, float, str]],
+        param_config: Dict[str, Any],
         n_trials: int = 100,
         study_name: str = "na6p_optimization",
-        storage: str = None
+        storage: str = None,
     ) -> optuna.Study:
-        """
-        Run the optimization.
-        
-        Args:
-            param_ranges: Dict of param_name -> (min, max, type)
-            n_trials: Number of optimization trials
-            study_name: Name for the Optuna study
-            storage: Optional database URL for persistent storage
-        
-        Returns:
-            Completed Optuna study
-        """
-        # Run simulation once
+        """Run the optimization."""
         self.run_simulation()
-        
-        # Create study
+
         study = optuna.create_study(
             study_name=study_name,
-            direction='minimize',
+            direction="maximize",
             storage=storage,
-            load_if_exists=True
+            load_if_exists=True,
         )
-        
-        # Run optimization
+
         study.optimize(
-            lambda trial: self.objective(trial, param_ranges),
+            lambda trial: self.objective(trial, param_config),
             n_trials=n_trials,
-            show_progress_bar=True
+            show_progress_bar=True,
         )
-        
+
         return study
 
 
 def example_metric_function(output_dir: str) -> float:
-    """
-    Example metric function - replace with your actual metric calculation.
-    
-    This should parse the output files in output_dir and return a single
-    float value to be MINIMIZED.
-    
-    Args:
-        output_dir: Directory containing reconstruction output
-        
-    Returns:
-        Metric value (lower is better)
-    """
-    # Example: parse some output file and calculate chi2 or similar
-    # This is just a placeholder - implement your actual metric here
-    
-    # For example, you might:
-    # 1. Read ROOT files with uproot
-    # 2. Calculate reconstruction efficiency
-    # 3. Calculate resolution
-    # 4. Return 1/efficiency or resolution as metric to minimize
-    
+    """Example metric function - replace with your actual metric calculation."""
     import random
-    return random.random()  # Placeholder - replace with real metric!
+
+    return random.random()
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Optimize NA6P reconstruction parameters using Optuna"
     )
-    parser.add_argument(
-        "--layout-ini",
-        required=True,
-        help="Path to layout INI file"
-    )
+    parser.add_argument("--layout-ini", required=True, help="Path to layout INI file")
     parser.add_argument(
         "--reco-ini",
         required=True,
-        help="Path to reconstruction parameter INI file (template)"
+        help="Path to reconstruction parameter INI file (template)",
     )
     parser.add_argument(
         "--n-trials",
         type=int,
+        default=10,
+        help="Number of optimization trials (default: 10)",
+    )
+    parser.add_argument(
+        "--n-events",
+        type=int,
         default=100,
-        help="Number of optimization trials (default: 100)"
-    )
-    parser.add_argument(
-        "--n-sim",
-        type=int,
-        default=50000,
-        help="Number of simulation events (default: 50000)"
-    )
-    parser.add_argument(
-        "--n-rec",
-        type=int,
-        default=50000,
-        help="Number of reconstruction events (default: 50000)"
+        help="Number of simulation events (default: 1000)",
     )
     parser.add_argument(
         "--work-dir",
         default="./optimization_work",
-        help="Working directory (default: ./optimization_work)"
+        help="Working directory (default: ./optimization_work)",
     )
     parser.add_argument(
         "--study-name",
         default="na6p_optimization",
-        help="Optuna study name (default: na6p_optimization)"
+        help="Optuna study name (default: na6p_optimization)",
+    )
+    parser.add_argument(
+        "--param-ranges",
+        default="params/param_ranges.json",
+        help="Path to parameter ranges config file (default: params/param_ranges.json)",
+    )
+    parser.add_argument(
+        "--metric-module",
+        default="metrics/example_metric_function.py",
+        help="Path to Python module defining 'metric_function' (default: metrics/example_metric_function.py)",
     )
     parser.add_argument(
         "--storage",
-        help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)"
+        help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)",
     )
-    
+
     args = parser.parse_args()
-    
-    # Define parameter ranges to optimize
-    # Format: param_name -> (min_value, max_value, type)
-    # type can be 'float', 'int', or 'log' (for log-scale)
-    param_ranges = {
-        # Vertexer parameters
-        'vertexerMaxDeltaThetaTracklet': (0.3, 1.0, 'float'),
-        'vertexerMaxDeltaPhiTracklet': (0.01, 0.1, 'float'),
-        'vertexerMaxDCAxy': (0.1, 0.5, 'float'),
-        'vertexerKDEBandwidth': (0.1, 1.0, 'float'),
-        
-        # VT Tracker CA parameters (first iteration)
-        'vtMaxDeltaThetaTrackletsCA[0]': (0.02, 0.1, 'float'),
-        'vtMaxDeltaPhiTrackletsCA[0]': (0.05, 0.2, 'float'),
-        
-        # MS Tracker CA parameters (first iteration)
-        'msMaxDeltaThetaTrackletsCA[0]': (0.03, 0.12, 'float'),
-        'msMaxDeltaPhiTrackletsCA[0]': (0.05, 0.2, 'float'),
-        
-        # Add more parameters as needed
-    }
-    
-    # Create optimizer
+
+    param_config = load_param_ranges(args.param_ranges)
+    metric_func = load_metric_function(args.metric_module)
+
     optimizer = INIParameterOptimizer(
         layout_ini=args.layout_ini,
         reco_ini_template=args.reco_ini,
-        metric_function=example_metric_function,  # Replace with your metric!
-        n_sim_events=args.n_sim,
-        n_rec_events=args.n_rec,
-        work_dir=args.work_dir
+        metric_function=metric_func,
+        n_events=args.n_events,
+        work_dir=args.work_dir,
     )
-    
-    # Run optimization
+
     study = optimizer.optimize(
-        param_ranges=param_ranges,
+        param_config=param_config,
         n_trials=args.n_trials,
         study_name=args.study_name,
-        storage=args.storage
+        storage=args.storage,
     )
-    
-    # Print results
-    print("\n" + "="*80)
+
+    print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
-    print("="*80)
+    print("=" * 80)
+    if not study.best_trials:
+        print("No completed trials were found. All trials were pruned or failed.")
+        print("Check the reconstruction logs above and the trial directories in the work dir.")
+        return
     print(f"Best trial: {study.best_trial.number}")
     print(f"Best metric value: {study.best_value:.6f}")
     print("\nBest parameters:")
     for param, value in study.best_params.items():
         print(f"  {param}: {value}")
-    
-    # Save best parameters to file
+
     best_ini = Path(args.work_dir) / "best_reco_params.ini"
     optimizer.update_ini_file(study.best_params, best_ini)
     print(f"\nBest parameters saved to: {best_ini}")
-    
-    # Optionally: plot optimization history
+
     try:
         import matplotlib.pyplot as plt
-        
-        fig = optuna.visualization.matplotlib.plot_optimization_history(study)
-        plt.savefig(Path(args.work_dir) / "optimization_history.png")
+
+        # Optimization history
+        ax = optuna.visualization.matplotlib.plot_optimization_history(study)
+        fig = ax.get_figure()
+        fig.set_size_inches(12, 6)
+        plt.tight_layout()
+        plt.savefig(Path(args.work_dir) / "optimization_history.png", dpi=150, bbox_inches="tight")
         print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
-        
-        fig = optuna.visualization.matplotlib.plot_param_importances(study)
-        plt.savefig(Path(args.work_dir) / "param_importances.png")
+        plt.close(fig)
+
+        # Parameter importances with better layout for many parameters
+        ax = optuna.visualization.matplotlib.plot_param_importances(study)
+        fig = ax.get_figure()
+        fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
+        plt.tight_layout()
+        plt.savefig(Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight")
         print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
+        plt.close(fig)
     except ImportError:
         print("\nInstall matplotlib for visualization: pip install matplotlib")
 
