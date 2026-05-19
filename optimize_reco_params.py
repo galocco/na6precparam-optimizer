@@ -4,6 +4,7 @@ Parameter optimization script for NA6P reconstruction using Optuna.
 """
 
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.fixes")
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*pkg_resources.*")
 warnings.filterwarnings("ignore", message=".*is experimental.*")
@@ -88,13 +89,32 @@ def load_param_ranges(config_path: str) -> Dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("The 'parameters' section must be a JSON object")
 
-    normalized: Dict[str, Any] = {"scalar": {}, "iterated": {}}
+    normalized: Dict[str, Any] = {
+        "scalar": {},
+        "iterated": {},
+        "reco_options": {},
+        "simulation_options": {},
+    }
     for param_name, spec in parameters.items():
         normalized_spec = _normalize_param_spec(param_name, spec)
         if "iterations_param" in normalized_spec or "iterations" in normalized_spec:
             normalized["iterated"][str(param_name)] = normalized_spec
         else:
             normalized["scalar"][str(param_name)] = normalized_spec
+
+    reco_options = data.get("reco_options", data.get("reconstruction_options", {}))
+    if reco_options is None:
+        reco_options = {}
+    if not isinstance(reco_options, dict):
+        raise ValueError("The 'reco_options' (or 'reconstruction_options') section must be a JSON object")
+    normalized["reco_options"] = reco_options
+
+    simulation_options = data.get("simulation_options", data.get("sim_options", {}))
+    if simulation_options is None:
+        simulation_options = {}
+    if not isinstance(simulation_options, dict):
+        raise ValueError("The 'simulation_options' (or 'sim_options') section must be a JSON object")
+    normalized["simulation_options"] = simulation_options
 
     return normalized
 
@@ -141,6 +161,8 @@ class INIParameterOptimizer:
         metric_function: Callable[[str], float],
         n_events: int = 50000,
         work_dir: str = "./optimization_work",
+        reco_options: Dict[str, Any] = None,
+        simulation_options: Dict[str, Any] = None,
     ):
         self.layout_ini = Path(layout_ini).resolve()
         self.reco_ini_template = Path(reco_ini_template).resolve()
@@ -150,10 +172,38 @@ class INIParameterOptimizer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.sim_done = False
 
+        default_reco_options = {
+            "doMatching": False,
+            "doHitsToRecPoints": True,
+            "doTrackletVertex": False,
+            "doVTTracking": False,
+        }
+        self.reco_options: Dict[str, Any] = dict(default_reco_options)
+        if reco_options:
+            for option_name, option_value in reco_options.items():
+                normalized_option_name = str(option_name)
+                if normalized_option_name.startswith("--"):
+                    normalized_option_name = normalized_option_name[2:]
+                self.reco_options[normalized_option_name] = option_value
+
+        default_simulation_options = {
+            "generator_macro": '$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,"Omega")',
+        }
+        self.simulation_options: Dict[str, Any] = dict(default_simulation_options)
+        if simulation_options:
+            for option_name, option_value in simulation_options.items():
+                self.simulation_options[str(option_name)] = option_value
+
         if not self.layout_ini.exists():
             raise FileNotFoundError(f"Layout INI not found: {self.layout_ini}")
         if not self.reco_ini_template.exists():
             raise FileNotFoundError(f"Reco INI template not found: {self.reco_ini_template}")
+
+    @staticmethod
+    def _format_cli_option_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
 
     def run_simulation(self):
         """Run na6psim once (only needs to be done once)."""
@@ -162,7 +212,7 @@ class INIParameterOptimizer:
 
         print("Running simulation (na6psim)...")
         generator_macro = os.path.expandvars(
-            '$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,"Omega")'
+            str(self.simulation_options.get("generator_macro", ""))
         )
         cmd = [
             "na6psim",
@@ -240,15 +290,10 @@ class INIParameterOptimizer:
             str(staged_reco_ini_path),
             "--load-ini",
             str(layout_ini_path),
-            "--doMatching",
-            "false",
-            "--doHitsToRecPoints",
-            "true",
-            "--doTrackletVertex",
-            "false",
-            "--doVTTracking",
-            "false",
         ]
+
+        for option_name, option_value in self.reco_options.items():
+            cmd.extend([f"--{option_name}", self._format_cli_option_value(option_value)])
 
         result = subprocess.run(
             cmd,
@@ -260,11 +305,21 @@ class INIParameterOptimizer:
         if result.returncode != 0:
             if result.stdout:
                 print(f"Reconstruction output:\n{result.stdout}")
+                with open(str(self.work_dir / "stdout.log"), "w") as f:
+                    f.write(result.stdout)
+                with open(str(trial_dir / "stdout.log"), "w") as f:
+                    f.write(result.stdout)
             if result.stderr:
                 print(f"Reconstruction failed:\n{result.stderr}")
             else:
                 print("Reconstruction failed with no stderr output.")
             raise optuna.TrialPruned()
+        
+        # Save stdout to both the reconstruction output directory and the trial directory.
+        with open(str(self.work_dir / "stdout.log"), "w") as f:
+            f.write(result.stdout)
+        with open(str(trial_dir / "stdout.log"), "w") as f:
+            f.write(result.stdout)
 
         metric = self.metric_function(str(self.work_dir))
         print(f"Metric value: {metric}")
@@ -315,21 +370,30 @@ class INIParameterOptimizer:
         n_trials: int = 100,
         study_name: str = "na6p_optimization",
         storage: str = None,
+        n_jobs: int = 1,
     ) -> optuna.Study:
         """Run the optimization."""
         self.run_simulation()
+
+        sampler = optuna.samplers.TPESampler(
+            multivariate=True,
+            group=True,
+            seed=42,
+        )
 
         study = optuna.create_study(
             study_name=study_name,
             direction="maximize",
             storage=storage,
             load_if_exists=True,
+            sampler=sampler,
         )
 
         study.optimize(
             lambda trial: self.objective(trial, param_config),
             n_trials=n_trials,
             show_progress_bar=True,
+            n_jobs=n_jobs,
         )
 
         return study
@@ -389,10 +453,19 @@ def main():
         help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)",
     )
 
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Number of parallel jobs for optimization (default: 1)",
+    )
+
     args = parser.parse_args()
 
     param_config = load_param_ranges(args.param_ranges)
     metric_func = load_metric_function(args.metric_module)
+    #first trial with default parameters from the .ini file
+    #default_params = load_default_params(args.reco_ini) --- IGNORE ---
 
     optimizer = INIParameterOptimizer(
         layout_ini=args.layout_ini,
@@ -400,6 +473,8 @@ def main():
         metric_function=metric_func,
         n_events=args.n_events,
         work_dir=args.work_dir,
+        reco_options=param_config.get("reco_options", {}),
+        simulation_options=param_config.get("simulation_options", {}),
     )
 
     study = optimizer.optimize(
@@ -407,6 +482,7 @@ def main():
         n_trials=args.n_trials,
         study_name=args.study_name,
         storage=args.storage,
+        n_jobs=args.n_jobs
     )
 
     print("\n" + "=" * 80)

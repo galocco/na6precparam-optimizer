@@ -1,4 +1,13 @@
 {
+  "reco_options": {
+    "doMatching": false,
+    "doHitsToRecPoints": true,
+    "doTrackletVertex": false,
+    "doVTTracking": false
+  },
+  "simulation_options": {
+    "generator_macro": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")"
+  },
   "parameters": {
     "msNIterationsTrackerCA": {
       "min": 2,
@@ -7,37 +16,37 @@
     },
     "msMaxDeltaThetaTrackletsCA": {
       "min": 0.02,
-      "max": 0.5,
+      "max": 1,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA"
     },
     "msMaxDeltaPhiTrackletsCA": {
       "min": 0.05,
-      "max": 0.5,
+      "max": 1,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA"
     },
     "msMaxDeltaTanLCellsCA": {
       "min": 0.5,
-      "max": 5.0,
+      "max": 50.0,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA"
     },
     "msMaxDeltaPhiCellsCA": {
       "min": 0.05,
-      "max": 0.5,
+      "max": 1,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA"
     },
     "msMaxDeltaPxPzCellsCA": {
       "min": 0.01,
-      "max": 0.5,
+      "max": 1,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA"
     },
     "msMaxDeltaPyPzCellsCA": {
       "min": 0.01,
-      "max": 0.5,
+      "max": 1,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA"
     }
