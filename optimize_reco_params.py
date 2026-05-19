@@ -6,7 +6,9 @@ Parameter optimization script for NA6P reconstruction using Optuna.
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.fixes")
-warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*pkg_resources.*")
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, message=".*pkg_resources.*"
+)
 warnings.filterwarnings("ignore", message=".*is experimental.*")
 
 import argparse
@@ -14,8 +16,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict
 
@@ -25,13 +29,13 @@ from optuna.trial import Trial
 
 def load_metric_function(module_path: str) -> Callable[[str], float]:
     """Dynamically load a metric function from a Python module.
-    
+
     Args:
         module_path: Path to Python file containing a 'metric_function' callable
-        
+
     Returns:
         The loaded metric function
-        
+
     Raises:
         FileNotFoundError: If the module path doesn't exist
         AttributeError: If the module doesn't define 'metric_function'
@@ -39,26 +43,25 @@ def load_metric_function(module_path: str) -> Callable[[str], float]:
     path = Path(module_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Metric module not found: {path}")
-    
+
     spec = importlib.util.spec_from_file_location("metric_module", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {path}")
-    
+
     module = importlib.util.module_from_spec(spec)
     sys.modules["metric_module"] = module
     spec.loader.exec_module(module)
-    
+
     if not hasattr(module, "metric_function"):
         raise AttributeError(
             f"Module {path} must define a 'metric_function(output_dir: str) -> float' function"
         )
-    
+
     func = getattr(module, "metric_function")
     if not callable(func):
         raise TypeError(f"'metric_function' in {path} must be callable")
-    
-    return func
 
+    return func
 
 
 def load_param_ranges(config_path: str) -> Dict[str, Any]:
@@ -83,7 +86,9 @@ def load_param_ranges(config_path: str) -> Dict[str, Any]:
             data = json.load(file_handle)
 
     if not isinstance(data, dict):
-        raise ValueError("Parameter ranges file must contain a JSON object at the top level")
+        raise ValueError(
+            "Parameter ranges file must contain a JSON object at the top level"
+        )
 
     parameters = data.get("parameters", data)
     if not isinstance(parameters, dict):
@@ -106,14 +111,18 @@ def load_param_ranges(config_path: str) -> Dict[str, Any]:
     if reco_options is None:
         reco_options = {}
     if not isinstance(reco_options, dict):
-        raise ValueError("The 'reco_options' (or 'reconstruction_options') section must be a JSON object")
+        raise ValueError(
+            "The 'reco_options' (or 'reconstruction_options') section must be a JSON object"
+        )
     normalized["reco_options"] = reco_options
 
     simulation_options = data.get("simulation_options", data.get("sim_options", {}))
     if simulation_options is None:
         simulation_options = {}
     if not isinstance(simulation_options, dict):
-        raise ValueError("The 'simulation_options' (or 'sim_options') section must be a JSON object")
+        raise ValueError(
+            "The 'simulation_options' (or 'sim_options') section must be a JSON object"
+        )
     normalized["simulation_options"] = simulation_options
 
     return normalized
@@ -171,12 +180,13 @@ class INIParameterOptimizer:
         self.work_dir = Path(work_dir).expanduser().resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.sim_done = False
+        self._reco_lock = threading.Lock()
 
         default_reco_options = {
-            "doMatching": False,
+            "doMatching": True,
             "doHitsToRecPoints": True,
-            "doTrackletVertex": False,
-            "doVTTracking": False,
+            "doTrackletVertex": True,
+            "doVTTracking": True,
         }
         self.reco_options: Dict[str, Any] = dict(default_reco_options)
         if reco_options:
@@ -197,7 +207,9 @@ class INIParameterOptimizer:
         if not self.layout_ini.exists():
             raise FileNotFoundError(f"Layout INI not found: {self.layout_ini}")
         if not self.reco_ini_template.exists():
-            raise FileNotFoundError(f"Reco INI template not found: {self.reco_ini_template}")
+            raise FileNotFoundError(
+                f"Reco INI template not found: {self.reco_ini_template}"
+            )
 
     @staticmethod
     def _format_cli_option_value(value: Any) -> str:
@@ -236,7 +248,9 @@ class INIParameterOptimizer:
         print("Simulation completed successfully")
         self.sim_done = True
 
-    def _suggest_param_value(self, trial: Trial, param_name: str, spec: Dict[str, Any]) -> Any:
+    def _suggest_param_value(
+        self, trial: Trial, param_name: str, spec: Dict[str, Any]
+    ) -> Any:
         min_value = spec["min"]
         max_value = spec["max"]
         param_type = str(spec["type"]).lower()
@@ -246,7 +260,9 @@ class INIParameterOptimizer:
         if param_type == "int":
             return trial.suggest_int(param_name, int(min_value), int(max_value))
         if param_type == "log":
-            return trial.suggest_float(param_name, float(min_value), float(max_value), log=True)
+            return trial.suggest_float(
+                param_name, float(min_value), float(max_value), log=True
+            )
 
         raise ValueError(f"Unknown parameter type for '{param_name}': {param_type}")
 
@@ -274,56 +290,105 @@ class INIParameterOptimizer:
         with open(output_path, "w", encoding="utf-8") as file_handle:
             file_handle.writelines(updated_lines)
 
+    def _stage_layout_ini_for_trial(self, trial_dir: Path) -> Path:
+        """Create a per-trial layout INI with explicit input_dir/output_dir."""
+        with open(self.layout_ini, "r", encoding="utf-8") as file_handle:
+            lines = file_handle.readlines()
+
+        updated_lines = []
+        input_set = False
+        output_set = False
+        for line in lines:
+            if re.match(r"^\s*input_dir\s*=", line):
+                print(f"Warning: Overriding existing input_dir in layout INI for trial {trial_dir.name} with {self.work_dir}")
+                updated_lines.append(f"input_dir={self.work_dir}\n")
+                input_set = True
+            elif re.match(r"^\s*output_dir\s*=", line):
+                updated_lines.append(f"output_dir={trial_dir}\n")
+                output_set = True
+            else:
+                updated_lines.append(line)
+
+        if not input_set:
+            updated_lines.append(f"input_dir={self.work_dir}\n")
+        if not output_set:
+            updated_lines.append(f"output_dir={trial_dir}\n")
+
+        staged_layout_ini_path = (trial_dir / "layout_trial.ini").resolve()
+        with open(staged_layout_ini_path, "w", encoding="utf-8") as file_handle:
+            file_handle.writelines(updated_lines)
+
+        return staged_layout_ini_path
+
     def run_reconstruction(self, reco_ini: Path, trial_dir: Path) -> float:
         """Run reconstruction with given parameters."""
         print(f"Running reconstruction in {trial_dir}...")
 
-        reco_ini_path = Path(reco_ini).resolve()
-        layout_ini_path = self.layout_ini.resolve()
-        staged_reco_ini_path = (self.work_dir / "reco_params.ini").resolve()
-        staged_reco_ini_path.write_text(reco_ini_path.read_text(encoding="utf-8"), encoding="utf-8")
+        with self._reco_lock:
+            expected_output_files = [
+                "TracksMuonSpec.root",
+                "ClustersMuonSpec.root",
+                "HitsMuonSpecModular.root",
+                "MCKine.root",
+            ]
+            for file_name in expected_output_files:
+                trial_file = trial_dir / file_name
+                if trial_file.exists():
+                    trial_file.unlink()
 
-        cmd = [
-            "na6prec",
-            f"-l{self.n_events}",
-            "--load-recoparam",
-            str(staged_reco_ini_path),
-            "--load-ini",
-            str(layout_ini_path),
-        ]
+            reco_ini_path = Path(reco_ini).resolve()
+            staged_layout_ini_path = self._stage_layout_ini_for_trial(trial_dir.resolve())
 
-        for option_name, option_value in self.reco_options.items():
-            cmd.extend([f"--{option_name}", self._format_cli_option_value(option_value)])
+            cmd = [
+                "na6prec",
+                f"-l{self.n_events}",
+                "--load-recoparam",
+                str(reco_ini_path),
+                "--load-ini",
+                str(staged_layout_ini_path),
+            ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=self.work_dir,
-        )
+            for option_name, option_value in self.reco_options.items():
+                cmd.extend(
+                    [f"--{option_name}", self._format_cli_option_value(option_value)]
+                )
 
-        if result.returncode != 0:
-            if result.stdout:
-                print(f"Reconstruction output:\n{result.stdout}")
-                with open(str(self.work_dir / "stdout.log"), "w") as f:
-                    f.write(result.stdout)
-                with open(str(trial_dir / "stdout.log"), "w") as f:
-                    f.write(result.stdout)
-            if result.stderr:
-                print(f"Reconstruction failed:\n{result.stderr}")
-            else:
-                print("Reconstruction failed with no stderr output.")
-            raise optuna.TrialPruned()
-        
-        # Save stdout to both the reconstruction output directory and the trial directory.
-        with open(str(self.work_dir / "stdout.log"), "w") as f:
-            f.write(result.stdout)
-        with open(str(trial_dir / "stdout.log"), "w") as f:
-            f.write(result.stdout)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.work_dir,
+            )
 
-        metric = self.metric_function(str(self.work_dir))
-        print(f"Metric value: {metric}")
-        return metric
+            if result.returncode != 0:
+                if result.stdout:
+                    print(f"Reconstruction output:\n{result.stdout}")
+                    with open(str(trial_dir / "stdout.log"), "w") as f:
+                        f.write(result.stdout)
+                if result.stderr:
+                    print(f"Reconstruction failed:\n{result.stderr}")
+                else:
+                    print("Reconstruction failed with no stderr output.")
+                raise optuna.TrialPruned()
+
+            # Save stdout to trial output directory.
+            with open(str(trial_dir / "stdout.log"), "w") as f:
+                f.write(result.stdout)
+
+            for file_name in expected_output_files:
+                trial_file = trial_dir / file_name
+                work_file = self.work_dir / file_name
+                if work_file.exists():
+                    shutil.copy2(work_file, trial_file)
+
+            try:
+                metric = self.metric_function(str(trial_dir))
+            except Exception as error:
+                print(f"Metric evaluation failed for {trial_dir}: {error}")
+                raise optuna.TrialPruned()
+
+            print(f"Metric value: {metric}")
+            return metric
 
     def objective(self, trial: Trial, param_config: Dict[str, Any]) -> float:
         """Objective function for Optuna."""
@@ -353,11 +418,15 @@ class INIParameterOptimizer:
                 )
 
             if iteration_count < 0:
-                raise ValueError(f"Iteration count for '{param_name}' must be non-negative")
+                raise ValueError(
+                    f"Iteration count for '{param_name}' must be non-negative"
+                )
 
             for index in range(iteration_count):
                 indexed_name = f"{param_name}[{index}]"
-                params[indexed_name] = self._suggest_param_value(trial, indexed_name, spec)
+                params[indexed_name] = self._suggest_param_value(
+                    trial, indexed_name, spec
+                )
 
         trial_reco_ini = trial_dir / "reco_params.ini"
         self.update_ini_file(params, trial_reco_ini)
@@ -379,6 +448,7 @@ class INIParameterOptimizer:
             multivariate=True,
             group=True,
             seed=42,
+            constant_liar=True,
         )
 
         study = optuna.create_study(
@@ -418,36 +488,43 @@ def main():
     )
     parser.add_argument(
         "--n-trials",
+        "-t",
         type=int,
         default=10,
         help="Number of optimization trials (default: 10)",
     )
     parser.add_argument(
         "--n-events",
+        "-n",
         type=int,
         default=100,
-        help="Number of simulation events (default: 1000)",
+        help="Number of simulation events (default: 100)",
     )
+
     parser.add_argument(
         "--work-dir",
         default="./optimization_work",
         help="Working directory (default: ./optimization_work)",
     )
+
     parser.add_argument(
         "--study-name",
         default="na6p_optimization",
         help="Optuna study name (default: na6p_optimization)",
     )
+
     parser.add_argument(
         "--param-ranges",
         default="params/param_ranges.json",
         help="Path to parameter ranges config file (default: params/param_ranges.json)",
     )
+
     parser.add_argument(
         "--metric-module",
         default="metrics/example_metric_function.py",
         help="Path to Python module defining 'metric_function' (default: metrics/example_metric_function.py)",
     )
+
     parser.add_argument(
         "--storage",
         help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)",
@@ -455,6 +532,7 @@ def main():
 
     parser.add_argument(
         "--n-jobs",
+        "-j",
         type=int,
         default=1,
         help="Number of parallel jobs for optimization (default: 1)",
@@ -464,8 +542,8 @@ def main():
 
     param_config = load_param_ranges(args.param_ranges)
     metric_func = load_metric_function(args.metric_module)
-    #first trial with default parameters from the .ini file
-    #default_params = load_default_params(args.reco_ini) --- IGNORE ---
+    # first trial with default parameters from the .ini file
+    # default_params = load_default_params(args.reco_ini) --- IGNORE ---
 
     optimizer = INIParameterOptimizer(
         layout_ini=args.layout_ini,
@@ -482,7 +560,7 @@ def main():
         n_trials=args.n_trials,
         study_name=args.study_name,
         storage=args.storage,
-        n_jobs=args.n_jobs
+        n_jobs=args.n_jobs,
     )
 
     print("\n" + "=" * 80)
@@ -490,7 +568,9 @@ def main():
     print("=" * 80)
     if not study.best_trials:
         print("No completed trials were found. All trials were pruned or failed.")
-        print("Check the reconstruction logs above and the trial directories in the work dir.")
+        print(
+            "Check the reconstruction logs above and the trial directories in the work dir."
+        )
         return
     print(f"Best trial: {study.best_trial.number}")
     print(f"Best metric value: {study.best_value:.6f}")
@@ -510,8 +590,14 @@ def main():
         fig = ax.get_figure()
         fig.set_size_inches(12, 6)
         plt.tight_layout()
-        plt.savefig(Path(args.work_dir) / "optimization_history.png", dpi=150, bbox_inches="tight")
-        print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
+        plt.savefig(
+            Path(args.work_dir) / "optimization_history.png",
+            dpi=150,
+            bbox_inches="tight",
+        )
+        print(
+            f"Optimization history saved to: {args.work_dir}/optimization_history.png"
+        )
         plt.close(fig)
 
         # Parameter importances with better layout for many parameters
@@ -519,7 +605,9 @@ def main():
         fig = ax.get_figure()
         fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
         plt.tight_layout()
-        plt.savefig(Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight")
+        plt.savefig(
+            Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight"
+        )
         print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
         plt.close(fig)
     except ImportError:

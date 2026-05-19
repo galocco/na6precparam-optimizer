@@ -35,6 +35,7 @@ def metric_function(output_dir: str) -> float:
     
     n_trackable = 0
     n_events = len(track_ids)
+    print(f"Total events: {n_events}")
 
     # Iterate through events
     for event_idx in range(n_events):
@@ -79,6 +80,7 @@ def metric_function(output_dir: str) -> float:
     
     print(f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}")
     print(f"Efficiency: {efficiency:.4f}, Time per event: {time_seconds / n_events:.4f}s")
-    print(f"Metric: {efficiency - time_seconds / n_events * 10:.4f}")
+    metric = efficiency - time_seconds / n_events * 5  # Time penalty (weight=5)
+    print(f"Metric: {metric:.4f}")
     
-    return efficiency - time_seconds / n_events * 10
+    return metric
