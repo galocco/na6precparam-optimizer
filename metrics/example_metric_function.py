@@ -53,7 +53,6 @@ def metric_function(output_dir: str) -> float:
 
         # group by track id
         unique_tracks = np.unique(ak.to_numpy(valid_tracks))
-
         for track_id in unique_tracks:
             mask = valid_tracks == track_id
             hit_detectors = valid_detectors[mask]
@@ -81,9 +80,9 @@ def metric_function(output_dir: str) -> float:
             time_seconds = float(match.group(1))
 
     print(f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}")
-    print(f"Efficiency: {efficiency:.4f}, Time/event: {time_seconds / n_events:.6f}s")
+    print(f"Efficiency: {efficiency:.4f}, Time/event: {time_seconds / n_events:.6f}s, Time/track: {time_seconds / n_reconstructed:.6f}s")
 
-    metric = efficiency - (time_seconds / n_events) * 5
+    metric = efficiency - (time_seconds / n_reconstructed)
     print(f"Metric: {metric:.4f}")
 
     return metric
