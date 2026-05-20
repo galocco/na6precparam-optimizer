@@ -187,6 +187,7 @@ class INIParameterOptimizer:
             "doHitsToRecPoints": True,
             "doTrackletVertex": True,
             "doVTTracking": True,
+            "doMSTracking": True
         }
         self.reco_options: Dict[str, Any] = dict(default_reco_options)
         if reco_options:
