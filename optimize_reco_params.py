@@ -441,9 +441,11 @@ class INIParameterOptimizer:
         study_name: str = "na6p_optimization",
         storage: str = None,
         n_jobs: int = 1,
+        skip_simulation: bool = False,
     ) -> optuna.Study:
         """Run the optimization."""
-        self.run_simulation()
+        if not skip_simulation:
+            self.run_simulation()
 
         sampler = optuna.samplers.TPESampler(
             multivariate=True,
@@ -481,9 +483,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Optimize NA6P reconstruction parameters using Optuna"
     )
-    parser.add_argument("--layout-ini", required=True, help="Path to layout INI file")
+    parser.add_argument("--layout-ini", 
+                        "-l",
+                        required=True, help="Path to layout INI file")
     parser.add_argument(
         "--reco-ini",
+        "-r",
         required=True,
         help="Path to reconstruction parameter INI file (template)",
     )
@@ -504,6 +509,7 @@ def main():
 
     parser.add_argument(
         "--work-dir",
+        "-d",
         default="./optimization_work",
         help="Working directory (default: ./optimization_work)",
     )
@@ -516,12 +522,14 @@ def main():
 
     parser.add_argument(
         "--param-ranges",
+        "-p",
         default="params/param_ranges.json",
         help="Path to parameter ranges config file (default: params/param_ranges.json)",
     )
 
     parser.add_argument(
         "--metric-module",
+        "-m",
         default="metrics/example_metric_function.py",
         help="Path to Python module defining 'metric_function' (default: metrics/example_metric_function.py)",
     )
@@ -529,6 +537,13 @@ def main():
     parser.add_argument(
         "--storage",
         help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)",
+    )
+
+    parser.add_argument(
+        "--skip-simulation",
+        "-s",
+        action="store_true",
+        help="Skip the simulation step (use with pre-generated simulation data)",
     )
 
     parser.add_argument(
@@ -562,6 +577,7 @@ def main():
         study_name=args.study_name,
         storage=args.storage,
         n_jobs=args.n_jobs,
+        skip_simulation=args.skip_simulation,
     )
 
     print("\n" + "=" * 80)
