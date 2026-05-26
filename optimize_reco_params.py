@@ -198,7 +198,8 @@ class INIParameterOptimizer:
                 self.reco_options[normalized_option_name] = option_value
 
         default_simulation_options = {
-            "generator_macro": '$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,"Omega")',
+            "generator": '$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,"Omega")',
+            "hook": None
         }
         self.simulation_options: Dict[str, Any] = dict(default_simulation_options)
         if simulation_options:
@@ -224,14 +225,19 @@ class INIParameterOptimizer:
             return
 
         print("Running simulation (na6psim)...")
-        generator_macro = os.path.expandvars(
-            str(self.simulation_options.get("generator_macro", ""))
+        generator = os.path.expandvars(
+            str(self.simulation_options.get("generator", ""))
+        )
+        hook = os.path.expandvars(
+            str(self.simulation_options.get("hook", ""))
         )
         cmd = [
             "na6psim",
             f"-n{self.n_events}",
             "-g",
-            generator_macro,
+            generator,
+            "-u" if hook else "",
+            hook if hook else "",
             "--load-ini",
             str(self.layout_ini),
         ]
