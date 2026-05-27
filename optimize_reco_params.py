@@ -28,18 +28,7 @@ from optuna.trial import Trial
 
 
 def load_metric_function(module_path: str) -> Callable[[str], float]:
-    """Dynamically load a metric function from a Python module.
-
-    Args:
-        module_path: Path to Python file containing a 'metric_function' callable
-
-    Returns:
-        The loaded metric function
-
-    Raises:
-        FileNotFoundError: If the module path doesn't exist
-        AttributeError: If the module doesn't define 'metric_function'
-    """
+    """Dynamically load a metric function from a Python module."""
     path = Path(module_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Metric module not found: {path}")
@@ -141,6 +130,9 @@ def _normalize_param_spec(param_name: str, spec: Any) -> Dict[str, Any]:
                 normalized_spec["iterations_param"] = str(spec["iterations_param"])
             if "iterations" in spec:
                 normalized_spec["iterations"] = spec["iterations"]
+            # NEW: optional monotone_increasing flag for iterated parameters
+            if "monotone_increasing" in spec:
+                normalized_spec["monotone_increasing"] = bool(spec["monotone_increasing"])
             return normalized_spec
 
         raise ValueError(
@@ -172,6 +164,7 @@ class INIParameterOptimizer:
         work_dir: str = "./optimization_work",
         reco_options: Dict[str, Any] = None,
         simulation_options: Dict[str, Any] = None,
+        monotone_increasing: bool = False,
     ):
         self.layout_ini = Path(layout_ini).resolve()
         self.reco_ini_template = Path(reco_ini_template).resolve()
@@ -181,6 +174,8 @@ class INIParameterOptimizer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.sim_done = False
         self._reco_lock = threading.Lock()
+        # NEW: global monotone_increasing flag (overridden per-param if set in config)
+        self.monotone_increasing = monotone_increasing
 
         default_reco_options = {
             "doMatching": True,
@@ -272,6 +267,53 @@ class INIParameterOptimizer:
             )
 
         raise ValueError(f"Unknown parameter type for '{param_name}': {param_type}")
+
+    def _suggest_monotone_increasing_values(
+        self,
+        trial: Trial,
+        param_name: str,
+        spec: Dict[str, Any],
+        iteration_count: int,
+    ) -> Dict[str, Any]:
+        """
+        Sample `iteration_count` values for `param_name` that are guaranteed to be
+        monotonically non-decreasing across iterations.
+
+        Strategy: sample N percentages pct[i] in [0, 1] with FIXED bounds (so that
+        all samplers, including CmaEsSampler, work without fallback), then reconstruct
+        the actual values as:
+
+            v[0] = min + pct[0] * (max - min)
+            v[i] = v[i-1] + pct[i] * (max - v[i-1])   for i >= 1
+
+        Each pct splits the remaining headroom above the previous value, so the
+        sequence is always non-decreasing and stays within [min, max].
+
+        The percentage variables are named  <param_name>_pct[i]  and never appear
+        in the INI file; only the reconstructed  <param_name>[i]  values do.
+        """
+        min_val = float(spec["min"])
+        max_val = float(spec["max"])
+        param_type = str(spec["type"]).lower()
+
+        if param_type not in ("float", "log", "int"):
+            raise ValueError(f"Unknown type '{param_type}' for parameter '{param_name}'")
+
+        result: Dict[str, Any] = {}
+        prev = min_val
+
+        for i in range(iteration_count):
+            pct_name = f"{param_name}_pct[{i}]"
+            pct = trial.suggest_float(pct_name, 0.0, 1.0)   # always [0,1] → fixed bounds
+            new_val = prev + pct * (max_val - prev)
+
+            if param_type == "int":
+                new_val = round(new_val)
+
+            result[f"{param_name}[{i}]"] = new_val
+            prev = new_val
+
+        return result
 
     def update_ini_file(self, params: Dict[str, Any], output_path: Path):
         """Update INI file with new parameter values."""
@@ -378,7 +420,6 @@ class INIParameterOptimizer:
                     print("Reconstruction failed with no stderr output.")
                 raise optuna.TrialPruned()
 
-            # Save stdout to trial output directory.
             with open(str(trial_dir / "stdout.log"), "w") as f:
                 f.write(result.stdout)
 
@@ -429,14 +470,31 @@ class INIParameterOptimizer:
                     f"Iteration count for '{param_name}' must be non-negative"
                 )
 
-            for index in range(iteration_count):
-                indexed_name = f"{param_name}[{index}]"
-                params[indexed_name] = self._suggest_param_value(
-                    trial, indexed_name, spec
+            # NEW: use monotone sampling if requested globally or per-parameter
+            use_monotone = spec.get("monotone_increasing", self.monotone_increasing)
+
+            if use_monotone:
+                indexed_params = self._suggest_monotone_increasing_values(
+                    trial, param_name, spec, iteration_count
                 )
+                params.update(indexed_params)
+            else:
+                for index in range(iteration_count):
+                    indexed_name = f"{param_name}[{index}]"
+                    params[indexed_name] = self._suggest_param_value(
+                        trial, indexed_name, spec
+                    )
 
         trial_reco_ini = trial_dir / "reco_params.ini"
         self.update_ini_file(params, trial_reco_ini)
+
+        # Store the fully reconstructed params (with param[i] keys, not _pct/_delta
+        # internals) as a user attribute so we can recover them for the best trial
+        # without having to re-run the sampling logic.
+        import json as _json
+        trial.set_user_attr("reconstructed_params", _json.dumps(
+            {k: float(v) if not isinstance(v, int) else v for k, v in params.items()}
+        ))
 
         return self.run_reconstruction(trial_reco_ini, trial_dir)
 
@@ -448,17 +506,44 @@ class INIParameterOptimizer:
         storage: str = None,
         n_jobs: int = 1,
         skip_simulation: bool = False,
+        sampler_name: str = "tpe",
     ) -> optuna.Study:
-        """Run the optimization."""
+        """Run the optimization.
+
+        Args:
+            sampler_name: Which Optuna sampler to use. Choices:
+                - "tpe"  (default) — TPESampler, handles dynamic search spaces well.
+                - "cmaes"          — CmaEsSampler, good for continuous spaces; requires
+                                     monotone_increasing=True (fixed [0,1] bounds) to
+                                     avoid independent-sampling fallback warnings.
+                - "random"         — RandomSampler, useful as a baseline.
+                - "nsga2"          — NSGAIISampler (multi-objective capable).
+        """
         if not skip_simulation:
             self.run_simulation()
 
-        sampler = optuna.samplers.TPESampler(
-            multivariate=True,
-            group=True,
-            seed=42,
-            constant_liar=True,
-        )
+        sampler_name = sampler_name.lower()
+        if sampler_name == "tpe":
+            sampler = optuna.samplers.TPESampler(
+                multivariate=True,
+                group=True,
+                seed=42,
+                constant_liar=True,
+            )
+        elif sampler_name == "cmaes":
+            sampler = optuna.samplers.CmaEsSampler(
+                seed=42,
+                warn_independent_sampling=False,  # suppressed: pct vars have fixed bounds
+                restart_strategy="ipop",
+            )
+        elif sampler_name == "random":
+            sampler = optuna.samplers.RandomSampler(seed=42)
+        elif sampler_name == "nsga2":
+            sampler = optuna.samplers.NSGAIISampler(seed=42)
+        else:
+            raise ValueError(
+                f"Unknown sampler '{sampler_name}'. Choose from: tpe, cmaes, random, nsga2"
+            )
 
         study = optuna.create_study(
             study_name=study_name,
@@ -481,7 +566,6 @@ class INIParameterOptimizer:
 def example_metric_function(output_dir: str) -> float:
     """Example metric function - replace with your actual metric calculation."""
     import random
-
     return random.random()
 
 
@@ -489,83 +573,72 @@ def main():
     parser = argparse.ArgumentParser(
         description="Optimize NA6P reconstruction parameters using Optuna"
     )
-    parser.add_argument("--layout-ini", 
-                        "-l",
-                        required=True, help="Path to layout INI file")
+    parser.add_argument("--layout-ini", "-l", required=True, help="Path to layout INI file")
     parser.add_argument(
-        "--reco-ini",
-        "-r",
-        required=True,
+        "--reco-ini", "-r", required=True,
         help="Path to reconstruction parameter INI file (template)",
     )
     parser.add_argument(
-        "--n-trials",
-        "-t",
-        type=int,
-        default=10,
+        "--n-trials", "-t", type=int, default=10,
         help="Number of optimization trials (default: 10)",
     )
     parser.add_argument(
-        "--n-events",
-        "-n",
-        type=int,
-        default=100,
+        "--n-events", "-n", type=int, default=100,
         help="Number of simulation events (default: 100)",
     )
-
     parser.add_argument(
-        "--work-dir",
-        "-d",
-        default="./optimization_work",
+        "--work-dir", "-d", default="./optimization_work",
         help="Working directory (default: ./optimization_work)",
     )
-
     parser.add_argument(
-        "--study-name",
-        default="na6p_optimization",
+        "--study-name", default="na6p_optimization",
         help="Optuna study name (default: na6p_optimization)",
     )
-
     parser.add_argument(
-        "--param-ranges",
-        "-p",
-        default="params/param_ranges.json",
+        "--param-ranges", "-p", default="params/param_ranges.json",
         help="Path to parameter ranges config file (default: params/param_ranges.json)",
     )
-
     parser.add_argument(
-        "--metric-module",
-        "-m",
-        default="metrics/example_metric_function.py",
+        "--metric-module", "-m", default="metrics/example_metric_function.py",
         help="Path to Python module defining 'metric_function' (default: metrics/example_metric_function.py)",
     )
-
     parser.add_argument(
         "--storage",
         help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)",
     )
-
     parser.add_argument(
-        "--skip-simulation",
-        "-s",
-        action="store_true",
+        "--skip-simulation", "-s", action="store_true",
         help="Skip the simulation step (use with pre-generated simulation data)",
     )
-
     parser.add_argument(
-        "--n-jobs",
-        "-j",
-        type=int,
-        default=1,
+        "--n-jobs", "-j", type=int, default=1,
         help="Number of parallel jobs for optimization (default: 1)",
+    )
+    parser.add_argument(
+        "--sampler",
+        default="tpe",
+        choices=["tpe", "cmaes", "random", "nsga2"],
+        help=(
+            "Optuna sampler to use (default: tpe). "
+            "Use 'cmaes' together with --monotone-increasing for best results: "
+            "the fixed [0,1] percentage encoding avoids dynamic-search-space warnings."
+        ),
+    )
+    parser.add_argument(
+        "--monotone-increasing",
+        action="store_true",
+        default=False,
+        help=(
+            "Force all iterated parameters to be monotonically non-decreasing "
+            "across iterations. Can also be set per-parameter in the config file "
+            "via 'monotone_increasing': true."
+        ),
     )
 
     args = parser.parse_args()
 
     param_config = load_param_ranges(args.param_ranges)
     metric_func = load_metric_function(args.metric_module)
-    # first trial with default parameters from the .ini file
-    # default_params = load_default_params(args.reco_ini) --- IGNORE ---
 
     optimizer = INIParameterOptimizer(
         layout_ini=args.layout_ini,
@@ -575,6 +648,7 @@ def main():
         work_dir=args.work_dir,
         reco_options=param_config.get("reco_options", {}),
         simulation_options=param_config.get("simulation_options", {}),
+        monotone_increasing=args.monotone_increasing,   # NEW
     )
 
     study = optimizer.optimize(
@@ -584,6 +658,7 @@ def main():
         storage=args.storage,
         n_jobs=args.n_jobs,
         skip_simulation=args.skip_simulation,
+        sampler_name=args.sampler,   # NEW
     )
 
     print("\n" + "=" * 80)
@@ -595,20 +670,32 @@ def main():
             "Check the reconstruction logs above and the trial directories in the work dir."
         )
         return
-    print(f"Best trial: {study.best_trial.number}")
+    best_trial = study.best_trial
+    print(f"Best trial: {best_trial.number}")
     print(f"Best metric value: {study.best_value:.6f}")
-    print("\nBest parameters:")
-    for param, value in study.best_params.items():
+
+    # Recover reconstructed param[i] values stored during the trial.
+    # When monotone_increasing is active, best_params contains _pct internals
+    # which are meaningless for the INI; reconstructed_params has the actual
+    # cut values already computed.
+    import json as _json
+    reconstructed_json = best_trial.user_attrs.get("reconstructed_params")
+    if reconstructed_json:
+        best_ini_params = _json.loads(reconstructed_json)
+    else:
+        best_ini_params = study.best_params
+
+    print("\nBest parameters (reconstructed):")
+    for param, value in best_ini_params.items():
         print(f"  {param}: {value}")
 
     best_ini = Path(args.work_dir) / "best_reco_params.ini"
-    optimizer.update_ini_file(study.best_params, best_ini)
+    optimizer.update_ini_file(best_ini_params, best_ini)
     print(f"\nBest parameters saved to: {best_ini}")
 
     try:
         import matplotlib.pyplot as plt
 
-        # Optimization history
         ax = optuna.visualization.matplotlib.plot_optimization_history(study)
         fig = ax.get_figure()
         fig.set_size_inches(12, 6)
@@ -618,12 +705,9 @@ def main():
             dpi=150,
             bbox_inches="tight",
         )
-        print(
-            f"Optimization history saved to: {args.work_dir}/optimization_history.png"
-        )
+        print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
         plt.close(fig)
 
-        # Parameter importances with better layout for many parameters
         ax = optuna.visualization.matplotlib.plot_param_importances(study)
         fig = ax.get_figure()
         fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
