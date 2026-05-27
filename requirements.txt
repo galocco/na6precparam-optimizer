@@ -1,0 +1,6 @@
+optuna
+json5
+cmaes
+uproot
+awkward
+numpy
