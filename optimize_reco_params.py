@@ -16,7 +16,6 @@ import importlib.util
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -231,6 +230,12 @@ class INIParameterOptimizer:
         hook = os.path.expandvars(
             str(self.simulation_options.get("hook", ""))
         )
+        staged_layout_ini_path = self._stage_layout_ini(
+            config_dir=self.work_dir,
+            input_dir=None,
+            output_dir=self.work_dir,
+            file_name="layout_simulation.ini",
+        )
         cmd = [
             "na6psim",
             f"-n{self.n_events}",
@@ -239,7 +244,7 @@ class INIParameterOptimizer:
             "-u" if hook else "",
             hook if hook else "",
             "--load-ini",
-            str(self.layout_ini),
+            str(staged_layout_ini_path),
         ]
         print(f"Executing command: {' '.join(cmd)}")
         result = subprocess.run(
@@ -344,31 +349,46 @@ class INIParameterOptimizer:
         with open(output_path, "w", encoding="utf-8") as file_handle:
             file_handle.writelines(updated_lines)
 
-    def _stage_layout_ini_for_trial(self, trial_dir: Path) -> Path:
-        """Create a per-trial layout INI with explicit input_dir/output_dir."""
+    def _stage_layout_ini(
+        self,
+        config_dir: Path,
+        input_dir: Path | None,
+        output_dir: Path | None,
+        file_name: str,
+    ) -> Path:
+        """Create a layout INI with explicit input/output directories when requested."""
         with open(self.layout_ini, "r", encoding="utf-8") as file_handle:
             lines = file_handle.readlines()
 
         updated_lines = []
-        input_set = False
-        output_set = False
+        input_set = input_dir is None
+        output_set = output_dir is None
         for line in lines:
             if re.match(r"^\s*input_dir\s*=", line):
-                print(f"Warning: Overriding existing input_dir in layout INI for trial {trial_dir.name} with {self.work_dir}")
-                updated_lines.append(f"input_dir={self.work_dir}\n")
+                if input_dir is None:
+                    updated_lines.append(line)
+                else:
+                    print(
+                        "Warning: Overriding existing input_dir in layout INI "
+                        f"for {config_dir.name} with {input_dir}"
+                    )
+                    updated_lines.append(f"input_dir={input_dir}\n")
                 input_set = True
             elif re.match(r"^\s*output_dir\s*=", line):
-                updated_lines.append(f"output_dir={trial_dir}\n")
+                if output_dir is None:
+                    updated_lines.append(line)
+                else:
+                    updated_lines.append(f"output_dir={output_dir}\n")
                 output_set = True
             else:
                 updated_lines.append(line)
 
         if not input_set:
-            updated_lines.append(f"input_dir={self.work_dir}\n")
+            updated_lines.append(f"input_dir={input_dir}\n")
         if not output_set:
-            updated_lines.append(f"output_dir={trial_dir}\n")
+            updated_lines.append(f"output_dir={output_dir}\n")
 
-        staged_layout_ini_path = (trial_dir / "layout_trial.ini").resolve()
+        staged_layout_ini_path = (config_dir / file_name).resolve()
         with open(staged_layout_ini_path, "w", encoding="utf-8") as file_handle:
             file_handle.writelines(updated_lines)
 
@@ -379,19 +399,16 @@ class INIParameterOptimizer:
         print(f"Running reconstruction in {trial_dir}...")
 
         with self._reco_lock:
-            expected_output_files = [
-                "TracksMuonSpec.root",
-                "ClustersMuonSpec.root",
-                "HitsMuonSpecModular.root",
-                "MCKine.root",
-            ]
-            for file_name in expected_output_files:
-                trial_file = trial_dir / file_name
-                if trial_file.exists():
-                    trial_file.unlink()
+            for trial_file in trial_dir.glob("*.root"):
+                trial_file.unlink()
 
             reco_ini_path = Path(reco_ini).resolve()
-            staged_layout_ini_path = self._stage_layout_ini_for_trial(trial_dir.resolve())
+            staged_layout_ini_path = self._stage_layout_ini(
+                config_dir=trial_dir.resolve(),
+                input_dir=self.work_dir,
+                output_dir=trial_dir.resolve(),
+                file_name="layout_trial.ini",
+            )
 
             cmd = [
                 "na6prec",
@@ -428,11 +445,13 @@ class INIParameterOptimizer:
             with open(str(trial_dir / "stdout.log"), "w") as f:
                 f.write(result.stdout)
 
-            for file_name in expected_output_files:
-                trial_file = trial_dir / file_name
-                work_file = self.work_dir / file_name
-                if work_file.exists():
-                    shutil.copy2(work_file, trial_file)
+            # Copy simulation-only files (e.g. HitsVerTel.root, geometry.root)
+            # that na6prec does not write but the metric may need.
+            import shutil as _shutil
+            for work_file in self.work_dir.glob("*.root"):
+                trial_file = trial_dir / work_file.name
+                if not trial_file.exists():
+                    _shutil.copy2(work_file, trial_file)
 
             try:
                 metric = self.metric_function(str(trial_dir))

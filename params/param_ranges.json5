@@ -22,7 +22,7 @@
       "max": 0.08,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA",
-      "monotone_increasing": true #force monotonicity across iterations
+      "monotone_increasing": true
     },
     "msMaxDeltaPhiTrackletsCA": {
       "min": 0,
