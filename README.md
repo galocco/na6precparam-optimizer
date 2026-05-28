@@ -38,12 +38,7 @@ This framework automates the process of finding optimal reconstruction parameter
 ### Install Python Dependencies
 
 ```bash
-pip install optuna matplotlib numpy
-```
-
-Optional (for ROOT file analysis):
-```bash
-pip install uproot awkward
+pip install -r requirements.txt
 ```
 ---
 
@@ -52,7 +47,7 @@ pip install uproot awkward
 ### 1. Prepare Your Configuration Files
 
 Ensure you have:
-- `na6pLayoutini` - Your layout configuration
+- `na6pLayout.ini` - Your layout configuration
 - `na6pRecoParam.ini` - Your reconstruction parameter template
 
 ### 2. Define Your Metric
@@ -65,7 +60,7 @@ def metric_function(output_dir: str) -> float:
     """Calculate reconstruction quality metric."""
     # Read output files from output_dir
     # Calculate metric (e.g., chi2, efficiency, resolution)
-    # Return value to MAXIMIZE
+    # Return value to maximize or minimize according to the json
     return metric_value
 ```
 
@@ -79,7 +74,7 @@ Create a `param_ranges.json` file in the project root, then point the script to 
         "vertexerMaxDeltaThetaTracklet": {"min": 0.3, "max": 1.0, "type": "float"},
         "vertexerKDEBandwidth": {"min": 0.1, "max": 1.0, "type": "float"},
         "vtNIterationsTrackerCA": {"min": 1, "max": 4, "type": "int"},
-        "vtMaxDeltaThetaTrackletsCA": {"min": 0.02, "max": 0.1, "type": "float", "iterations_param": "vtNIterationsTrackerCA"}
+        "vtMaxDeltaThetaTrackletsCA": {"min": 0.02, "max": 0.1, "type": "float", "iterations_param": "vtNIterationsTrackerCA", "monotone_increasing": true }
     }
 }
 ```
@@ -220,7 +215,7 @@ Optuna uses **Tree-structured Parzen Estimator (TPE)** by default, which:
 
 ## Adding Custom Metrics
 
-The metric function is the heart of the optimization. It evaluates how "good" a parameter set is.
+The metric function evaluates how "good" a parameter set is.
 
 ### Metric Function Template
 
@@ -233,7 +228,7 @@ def your_metric_function(output_dir: str) -> float:
         output_dir: Directory containing na6prec output files
         
     Returns:
-        Float value to MAXIMIZE (higher = better)
+        Float value to maximize or minimize according to the json
     """
     # Your implementation here
     return metric_value
@@ -334,40 +329,6 @@ def combined_metric(output_dir: str) -> float:
         return metric
 ```
 
-### Example 4: Parsing Text Output
-
-```python
-def chi2_from_log(output_dir: str) -> float:
-    """Extract chi2 from log file."""
-    import re
-    from pathlib import Path
-    
-    log_files = list(Path(output_dir).glob("*.log"))
-    if not log_files:
-        return 1e10
-    
-    with open(log_files[0], 'r') as f:
-        content = f.read()
-    
-    # Search for chi2 value
-    match = re.search(r'Average Chi2/NDF:\s*([0-9.]+)', content)
-    if match:
-        chi2 = float(match.group(1))
-        return chi2
-    
-    return 1e10  # Penalty if not found
-```
-
-### Tips for Writing Metrics
-
-1. **Always return a float** - Optuna needs a single number
-2. **Higher is better** - Optuna set to maximize
-3. **Handle failures gracefully** - Return a large penalty value (e.g., `1e10`) if analysis fails
-4. **Normalize different scales** - If combining metrics, scale them appropriately
-5. **Consider adding constraints** - Return penalty if parameters violate physics constraints
-
----
-
 ## Adding Parameters
 
 ### Parameter Format
@@ -381,11 +342,6 @@ Parameters are defined in `params/param_ranges.json` under the `parameters` obje
     }
 }
 ```
-
-**Types:**
-- `'float'` - Continuous decimal values
-- `'int'` - Integer values
-- `'log'` - Log-scale floats (for parameters spanning orders of magnitude)
 
 For compatibility with the current script, encode these ranges in `params/param_ranges.json` using the JSON object format shown above.
 
@@ -433,10 +389,10 @@ For compatibility with the current script, encode these ranges in `params/param_
 {
     "parameters": {
         "vtNIterationsTrackerCA": {"min": 1, "max": 4, "type": "int"},
-        "vtMaxDeltaThetaTrackletsCA": {"min": 0.02, "max": 0.08, "type": "float", "iterations_param": "vtNIterationsTrackerCA"},
-        "vtMaxDeltaPhiTrackletsCA": {"min": 0.05, "max": 0.15, "type": "float", "iterations_param": "vtNIterationsTrackerCA"},
-        "vtMaxDeltaTanLCellsCA": {"min": 2, "max": 8, "type": "int", "iterations_param": "vtNIterationsTrackerCA"},
-        "vtMaxDeltaPhiCellsCA": {"min": 0.2, "max": 0.6, "type": "float", "iterations_param": "vtNIterationsTrackerCA"}
+        "vtMaxDeltaThetaTrackletsCA": {"min": 0.02, "max": 0.08, "type": "float", "iterations_param": "vtNIterationsTrackerCA", "monotone_increasing": true},
+        "vtMaxDeltaPhiTrackletsCA": {"min": 0.05, "max": 0.15, "type": "float", "iterations_param": "vtNIterationsTrackerCA", "monotone_increasing": true},
+        "vtMaxDeltaTanLCellsCA": {"min": 2, "max": 8, "type": "int", "iterations_param": "vtNIterationsTrackerCA", "monotone_increasing": true},
+        "vtMaxDeltaPhiCellsCA": {"min": 0.2, "max": 0.6, "type": "float", "iterations_param": "vtNIterationsTrackerCA", "monotone_increasing": true}
     }
 }
 ```
