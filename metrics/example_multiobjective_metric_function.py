@@ -10,7 +10,7 @@ import uproot
 
 nclusters_threshold = 4  # Minimum clusters for a track to be considered reconstructed
 
-def metric_function(output_dir: str) -> float:
+def metric_function(output_dir: str) -> tuple[float, float]:
     """
     Calculate reconstruction quality: efficiency - time_penalty
     Returns:
@@ -80,7 +80,4 @@ def metric_function(output_dir: str) -> float:
     print(f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}")
     print(f"Efficiency: {efficiency:.4f}, Time/event: {time_seconds / n_events:.6f}s, Time/track: {time_seconds / n_reconstructed:.6f}s")
 
-    metric = efficiency - (time_seconds / n_reconstructed)
-    print(f"Metric: {metric:.4f}")
-
-    return metric
+    return efficiency, time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0   

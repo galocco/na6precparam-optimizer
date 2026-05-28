@@ -4,3 +4,4 @@ cmaes
 uproot
 awkward
 numpy
+matplotlib

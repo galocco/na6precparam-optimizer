@@ -22,6 +22,7 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict
+import matplotlib.pyplot as plt
 
 import optuna
 from optuna.trial import Trial
@@ -114,6 +115,11 @@ def load_param_ranges(config_path: str) -> Dict[str, Any]:
         )
     normalized["simulation_options"] = simulation_options
 
+    objectives = data.get("objective", ["maximize"])
+    if isinstance(objectives, str):
+        objectives = [objectives]
+    normalized["objectives"] = objectives
+
     return normalized
 
 
@@ -130,7 +136,6 @@ def _normalize_param_spec(param_name: str, spec: Any) -> Dict[str, Any]:
                 normalized_spec["iterations_param"] = str(spec["iterations_param"])
             if "iterations" in spec:
                 normalized_spec["iterations"] = spec["iterations"]
-            # NEW: optional monotone_increasing flag for iterated parameters
             if "monotone_increasing" in spec:
                 normalized_spec["monotone_increasing"] = bool(spec["monotone_increasing"])
             return normalized_spec
@@ -470,7 +475,6 @@ class INIParameterOptimizer:
                     f"Iteration count for '{param_name}' must be non-negative"
                 )
 
-            # NEW: use monotone sampling if requested globally or per-parameter
             use_monotone = spec.get("monotone_increasing", self.monotone_increasing)
 
             if use_monotone:
@@ -507,6 +511,7 @@ class INIParameterOptimizer:
         n_jobs: int = 1,
         skip_simulation: bool = False,
         sampler_name: str = "tpe",
+        directions: list[str] = None,
     ) -> optuna.Study:
         """Run the optimization.
 
@@ -533,7 +538,7 @@ class INIParameterOptimizer:
         elif sampler_name == "cmaes":
             sampler = optuna.samplers.CmaEsSampler(
                 seed=42,
-                warn_independent_sampling=False,  # suppressed: pct vars have fixed bounds
+                warn_independent_sampling=False,
                 restart_strategy="ipop",
             )
         elif sampler_name == "random":
@@ -545,9 +550,11 @@ class INIParameterOptimizer:
                 f"Unknown sampler '{sampler_name}'. Choose from: tpe, cmaes, random, nsga2"
             )
 
+        is_multi = directions is not None and len(directions) > 1
         study = optuna.create_study(
             study_name=study_name,
-            direction="maximize",
+            direction=directions[0] if not is_multi else None,
+            directions=directions if is_multi else None,
             storage=storage,
             load_if_exists=True,
             sampler=sampler,
@@ -638,6 +645,8 @@ def main():
     args = parser.parse_args()
 
     param_config = load_param_ranges(args.param_ranges)
+    objectives    = param_config.get("objectives", ["maximize"])
+
     metric_func = load_metric_function(args.metric_module)
 
     optimizer = INIParameterOptimizer(
@@ -648,7 +657,7 @@ def main():
         work_dir=args.work_dir,
         reco_options=param_config.get("reco_options", {}),
         simulation_options=param_config.get("simulation_options", {}),
-        monotone_increasing=args.monotone_increasing,   # NEW
+        monotone_increasing=args.monotone_increasing,
     )
 
     study = optimizer.optimize(
@@ -658,67 +667,112 @@ def main():
         storage=args.storage,
         n_jobs=args.n_jobs,
         skip_simulation=args.skip_simulation,
-        sampler_name=args.sampler,   # NEW
+        sampler_name=args.sampler,
+        directions=objectives,
     )
 
     print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
     print("=" * 80)
-    if not study.best_trials:
-        print("No completed trials were found. All trials were pruned or failed.")
-        print(
-            "Check the reconstruction logs above and the trial directories in the work dir."
-        )
-        return
-    best_trial = study.best_trial
-    print(f"Best trial: {best_trial.number}")
-    print(f"Best metric value: {study.best_value:.6f}")
 
-    # Recover reconstructed param[i] values stored during the trial.
-    # When monotone_increasing is active, best_params contains _pct internals
-    # which are meaningless for the INI; reconstructed_params has the actual
-    # cut values already computed.
-    import json as _json
-    reconstructed_json = best_trial.user_attrs.get("reconstructed_params")
-    if reconstructed_json:
-        best_ini_params = _json.loads(reconstructed_json)
+    is_multi = len(param_config.get("objectives", ["maximize"])) > 1
+    obj_names = param_config.get("objective_names", [f"obj_{i}" for i in range(len(param_config.get("objectives", ["maximize"])))])
+
+    if is_multi:
+        pareto = study.best_trials
+        if not pareto:
+            print("No completed trials found. All trials were pruned or failed.")
+            return
+        print(f"Pareto front: {len(pareto)} non-dominated solutions")
+        for t in pareto:
+            vals = ", ".join(f"{n}={v:.6f}" for n, v in zip(obj_names, t.values))
+            print(f"  Trial {t.number}: {vals}")
+            reconstructed = json.loads(t.user_attrs.get("reconstructed_params", "{}"))
+            best_ini = Path(args.work_dir) / f"best_reco_params_pareto_{t.number}.ini"
+            optimizer.update_ini_file(reconstructed or t.params, best_ini)
+            print(f"    Saved to: {best_ini}")
     else:
-        best_ini_params = study.best_params
-
-    print("\nBest parameters (reconstructed):")
-    for param, value in best_ini_params.items():
-        print(f"  {param}: {value}")
-
-    best_ini = Path(args.work_dir) / "best_reco_params.ini"
-    optimizer.update_ini_file(best_ini_params, best_ini)
-    print(f"\nBest parameters saved to: {best_ini}")
+        if not study.best_trials:
+            print("No completed trials found. All trials were pruned or failed.")
+            return
+        best_trial = study.best_trial
+        print(f"Best trial: {best_trial.number}")
+        print(f"Best metric value: {study.best_value:.6f}")
+        reconstructed = json.loads(best_trial.user_attrs.get("reconstructed_params", "{}"))
+        best_ini_params = reconstructed or study.best_params
+        print("\nBest parameters (reconstructed):")
+        for param, value in best_ini_params.items():
+            print(f"  {param}: {value}")
+        best_ini = Path(args.work_dir) / "best_reco_params.ini"
+        optimizer.update_ini_file(best_ini_params, best_ini)
+        print(f"\nBest parameters saved to: {best_ini}")
 
     try:
         import matplotlib.pyplot as plt
 
-        ax = optuna.visualization.matplotlib.plot_optimization_history(study)
-        fig = ax.get_figure()
-        fig.set_size_inches(12, 6)
-        plt.tight_layout()
-        plt.savefig(
-            Path(args.work_dir) / "optimization_history.png",
-            dpi=150,
-            bbox_inches="tight",
-        )
-        print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
-        plt.close(fig)
+        if is_multi:
+            if len(obj_names) == 2:
+                ax = optuna.visualization.matplotlib.plot_pareto_front(
+                    study, target_names=obj_names
+                )
+                fig = ax.get_figure()
+                fig.savefig(Path(args.work_dir) / "pareto_front.png", dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                print(f"Pareto front saved to: {args.work_dir}/pareto_front.png")
 
-        ax = optuna.visualization.matplotlib.plot_param_importances(study)
-        fig = ax.get_figure()
-        fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
-        plt.tight_layout()
-        plt.savefig(
-            Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight"
-        )
-        print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
-        plt.close(fig)
+            for i, obj_name in enumerate(obj_names):
+                target_fn = lambda t, i=i: t.values[i]
+
+                ax = optuna.visualization.matplotlib.plot_optimization_history(
+                    study, target=target_fn, target_name=obj_name
+                )
+                fig = ax.get_figure()
+                fig.set_size_inches(12, 6)
+                plt.tight_layout()
+                fig.savefig(
+                    Path(args.work_dir) / f"optimization_history_{obj_name}.png",
+                    dpi=150, bbox_inches="tight",
+                )
+                plt.close(fig)
+
+                ax = optuna.visualization.matplotlib.plot_param_importances(
+                    study, target=target_fn, target_name=obj_name
+                )
+                fig = ax.get_figure()
+                fig.set_size_inches(12, max(6, len(study.best_trials[0].params) * 0.3))
+                plt.tight_layout()
+                fig.savefig(
+                    Path(args.work_dir) / f"param_importances_{obj_name}.png",
+                    dpi=150, bbox_inches="tight",
+                )
+                plt.close(fig)
+
+            print(f"Per-objective plots saved to: {args.work_dir}/")
+
+        else:
+            ax = optuna.visualization.matplotlib.plot_optimization_history(study)
+            fig = ax.get_figure()
+            fig.set_size_inches(12, 6)
+            plt.tight_layout()
+            fig.savefig(
+                Path(args.work_dir) / "optimization_history.png", dpi=150, bbox_inches="tight"
+            )
+            plt.close(fig)
+            print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
+
+            ax = optuna.visualization.matplotlib.plot_param_importances(study)
+            fig = ax.get_figure()
+            fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
+            plt.tight_layout()
+            fig.savefig(
+                Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight"
+            )
+            plt.close(fig)
+            print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
+
     except ImportError:
         print("\nInstall matplotlib for visualization: pip install matplotlib")
+
 
 
 if __name__ == "__main__":

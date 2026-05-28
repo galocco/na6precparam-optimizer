@@ -1,5 +1,5 @@
 {
-  "objective": ["maximize"],
+  "objective": ["maximize", "minimize"],
   "reco_options": {
     "doMatching": false,
     "doHitsToRecPoints": true,
@@ -14,7 +14,7 @@
   "parameters": {
     "msNIterationsTrackerCA": {
       "min": 2,
-      "max": 6,
+      "max": 4,
       "type": "int"
     },
     "msMaxDeltaThetaTrackletsCA": {
@@ -22,7 +22,7 @@
       "max": 0.08,
       "type": "float",
       "iterations_param": "msNIterationsTrackerCA",
-      "monotone_increasing": true #force monotonicity across iterations
+      "monotone_increasing": true 
     },
     "msMaxDeltaPhiTrackletsCA": {
       "min": 0,
