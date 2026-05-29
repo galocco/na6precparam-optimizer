@@ -198,7 +198,7 @@ class INIParameterOptimizer:
 
         default_simulation_options = {
             "generator": '$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,"Omega")',
-            "hook": None
+            "hook": ""
         }
         self.simulation_options: Dict[str, Any] = dict(default_simulation_options)
         if simulation_options:
@@ -241,8 +241,7 @@ class INIParameterOptimizer:
             f"-n{self.n_events}",
             "-g",
             generator,
-            "-u" if hook else "",
-            hook if hook else "",
+            *([f"-u{hook}"] if hook else []),
             "--load-ini",
             str(staged_layout_ini_path),
         ]
@@ -726,72 +725,65 @@ def main():
         optimizer.update_ini_file(best_ini_params, best_ini)
         print(f"\nBest parameters saved to: {best_ini}")
 
-    try:
-        import matplotlib.pyplot as plt
+    if is_multi:
+        if len(obj_names) == 2:
+            ax = optuna.visualization.matplotlib.plot_pareto_front(
+                study, target_names=obj_names
+            )
+            fig = ax.get_figure()
+            fig.savefig(Path(args.work_dir) / "pareto_front.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Pareto front saved to: {args.work_dir}/pareto_front.png")
 
-        if is_multi:
-            if len(obj_names) == 2:
-                ax = optuna.visualization.matplotlib.plot_pareto_front(
-                    study, target_names=obj_names
-                )
-                fig = ax.get_figure()
-                fig.savefig(Path(args.work_dir) / "pareto_front.png", dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                print(f"Pareto front saved to: {args.work_dir}/pareto_front.png")
+        for i, obj_name in enumerate(obj_names):
+            target_fn = lambda t, i=i: t.values[i]
 
-            for i, obj_name in enumerate(obj_names):
-                target_fn = lambda t, i=i: t.values[i]
-
-                ax = optuna.visualization.matplotlib.plot_optimization_history(
-                    study, target=target_fn, target_name=obj_name
-                )
-                fig = ax.get_figure()
-                fig.set_size_inches(12, 6)
-                plt.tight_layout()
-                fig.savefig(
-                    Path(args.work_dir) / f"optimization_history_{obj_name}.png",
-                    dpi=150, bbox_inches="tight",
-                )
-                plt.close(fig)
-
-                ax = optuna.visualization.matplotlib.plot_param_importances(
-                    study, target=target_fn, target_name=obj_name
-                )
-                fig = ax.get_figure()
-                fig.set_size_inches(12, max(6, len(study.best_trials[0].params) * 0.3))
-                plt.tight_layout()
-                fig.savefig(
-                    Path(args.work_dir) / f"param_importances_{obj_name}.png",
-                    dpi=150, bbox_inches="tight",
-                )
-                plt.close(fig)
-
-            print(f"Per-objective plots saved to: {args.work_dir}/")
-
-        else:
-            ax = optuna.visualization.matplotlib.plot_optimization_history(study)
+            ax = optuna.visualization.matplotlib.plot_optimization_history(
+                study, target=target_fn, target_name=obj_name
+            )
             fig = ax.get_figure()
             fig.set_size_inches(12, 6)
             plt.tight_layout()
             fig.savefig(
-                Path(args.work_dir) / "optimization_history.png", dpi=150, bbox_inches="tight"
+                Path(args.work_dir) / f"optimization_history_{obj_name}.png",
+                dpi=150, bbox_inches="tight",
             )
             plt.close(fig)
-            print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
 
-            ax = optuna.visualization.matplotlib.plot_param_importances(study)
+            ax = optuna.visualization.matplotlib.plot_param_importances(
+                study, target=target_fn, target_name=obj_name
+            )
             fig = ax.get_figure()
-            fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
+            fig.set_size_inches(12, max(6, len(study.best_trials[0].params) * 0.3))
             plt.tight_layout()
             fig.savefig(
-                Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight"
+                Path(args.work_dir) / f"param_importances_{obj_name}.png",
+                dpi=150, bbox_inches="tight",
             )
             plt.close(fig)
-            print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
 
-    except ImportError:
-        print("\nInstall matplotlib for visualization: pip install matplotlib")
+        print(f"Per-objective plots saved to: {args.work_dir}/")
 
+    else:
+        ax = optuna.visualization.matplotlib.plot_optimization_history(study)
+        fig = ax.get_figure()
+        fig.set_size_inches(12, 6)
+        plt.tight_layout()
+        fig.savefig(
+            Path(args.work_dir) / "optimization_history.png", dpi=150, bbox_inches="tight"
+        )
+        plt.close(fig)
+        print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
+
+        ax = optuna.visualization.matplotlib.plot_param_importances(study)
+        fig = ax.get_figure()
+        fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
+        plt.tight_layout()
+        fig.savefig(
+            Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight"
+        )
+        plt.close(fig)
+        print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
 
 
 if __name__ == "__main__":
