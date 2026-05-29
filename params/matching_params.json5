@@ -1,0 +1,41 @@
+{
+  "objective": ["maximize"],
+  "reco_options": {
+    "doMatching": true,
+    "doHitsToRecPoints": true,
+    "doTrackletVertex": false,
+    "doVTTracking": true,
+    "doMSTracking": true
+  },
+  "simulation_options": {
+    "generator": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")",
+    "hook": "$NA6PROOT_ROOT/share/test/testHooks.C",
+  },
+  "parameters": {
+    "mtZMatching": {
+      "min": 38,
+      "max": 350,
+      "type": "float"
+    },
+    "mtMinTrackP": {
+      "min": 1.5,
+      "max": 3,
+      "type": "float"
+    },
+    "mtMaxChi2Match": {
+      "min": 10,
+      "max": 100,
+      "type": "float"
+    },
+    "mtMaxChi2Refit": {
+      "min": 10,
+      "max": 100,
+      "type": "float"
+    },
+    "mtPMatchWindow": {
+      "min": 0,
+      "max": 5,
+      "type": "float"
+    }
+  }
+}
