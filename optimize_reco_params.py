@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -176,6 +177,7 @@ class INIParameterOptimizer:
         self.n_events = n_events
         self.work_dir = Path(work_dir).expanduser().resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.study_dir = self.work_dir
         self.sim_done = False
         self._reco_lock = threading.Lock()
         # NEW: global monotone_increasing flag (overridden per-param if set in config)
@@ -218,6 +220,57 @@ class INIParameterOptimizer:
             return "true" if value else "false"
         return str(value)
 
+    @staticmethod
+    def _sanitize_study_name(study_name: str) -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", study_name).strip("._")
+        return safe_name or "na6p_optimization"
+
+    def _create_versioned_study_dir(self, study_name: str) -> Path:
+        safe_name = self._sanitize_study_name(study_name)
+        study_root = self.work_dir / safe_name
+        study_root.mkdir(parents=True, exist_ok=True)
+
+        version = 1
+        while (study_root / f"v{version:03d}").exists():
+            version += 1
+
+        study_dir = study_root / f"v{version:03d}"
+        study_dir.mkdir(parents=True, exist_ok=False)
+        return study_dir
+
+    @staticmethod
+    def _enable_sqlite_wal(db_path: Path) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(db_path)) as connection:
+            connection.execute("PRAGMA journal_mode=WAL;")
+            connection.execute("PRAGMA synchronous=NORMAL;")
+            connection.execute("PRAGMA busy_timeout=60000;")
+            connection.commit()
+
+    def _prepare_study_storage(
+        self, study_name: str, storage: str | None
+    ) -> tuple[str | None, str, bool]:
+        if storage:
+            normalized_storage = storage.strip()
+            if normalized_storage.lower().startswith("sqlite:///"):
+                db_path = Path(os.path.expanduser(normalized_storage[10:])).resolve()
+                self._enable_sqlite_wal(db_path)
+                self.study_dir = db_path.parent
+            else:
+                self.study_dir = self.work_dir
+
+            return normalized_storage, study_name, True
+
+        study_dir = self._create_versioned_study_dir(study_name)
+        self.study_dir = study_dir
+        db_path = study_dir / "optuna_study.db"
+        self._enable_sqlite_wal(db_path)
+
+        safe_name = self._sanitize_study_name(study_name)
+        versioned_study_name = f"{safe_name}_{study_dir.name}"
+        sqlite_storage = f"sqlite:///{db_path}"
+        return sqlite_storage, versioned_study_name, False
+
     def run_simulation(self):
         """Run na6psim once (only needs to be done once)."""
         if self.sim_done:
@@ -231,9 +284,9 @@ class INIParameterOptimizer:
             str(self.simulation_options.get("hook", ""))
         )
         staged_layout_ini_path = self._stage_layout_ini(
-            config_dir=self.work_dir,
+            config_dir=self.study_dir,
             input_dir=None,
-            output_dir=self.work_dir,
+            output_dir=self.study_dir,
             file_name="layout_simulation.ini",
         )
         cmd = [
@@ -250,7 +303,7 @@ class INIParameterOptimizer:
             cmd,
             capture_output=True,
             text=True,
-            cwd=self.work_dir,
+            cwd=self.study_dir,
         )
 
         if result.returncode != 0:
@@ -404,7 +457,7 @@ class INIParameterOptimizer:
             reco_ini_path = Path(reco_ini).resolve()
             staged_layout_ini_path = self._stage_layout_ini(
                 config_dir=trial_dir.resolve(),
-                input_dir=self.work_dir,
+                input_dir=self.study_dir,
                 output_dir=trial_dir.resolve(),
                 file_name="layout_trial.ini",
             )
@@ -427,7 +480,7 @@ class INIParameterOptimizer:
                 cmd,
                 capture_output=True,
                 text=True,
-                cwd=self.work_dir,
+                cwd=self.study_dir,
             )
 
             if result.returncode != 0:
@@ -447,7 +500,7 @@ class INIParameterOptimizer:
             # Copy simulation-only files (e.g. HitsVerTel.root, geometry.root)
             # that na6prec does not write but the metric may need.
             import shutil as _shutil
-            for work_file in self.work_dir.glob("*.root"):
+            for work_file in self.study_dir.glob("*.root"):
                 trial_file = trial_dir / work_file.name
                 if not trial_file.exists():
                     _shutil.copy2(work_file, trial_file)
@@ -463,7 +516,7 @@ class INIParameterOptimizer:
 
     def objective(self, trial: Trial, param_config: Dict[str, Any]) -> float:
         """Objective function for Optuna."""
-        trial_dir = self.work_dir / f"trial_{trial.number}"
+        trial_dir = self.study_dir / f"trial_{trial.number}"
         trial_dir.mkdir(exist_ok=True)
 
         params: Dict[str, Any] = {}
@@ -542,6 +595,13 @@ class INIParameterOptimizer:
                 - "random"         — RandomSampler, useful as a baseline.
                 - "nsga2"          — NSGAIISampler (multi-objective capable).
         """
+        effective_storage, effective_study_name, load_if_exists = (
+            self._prepare_study_storage(study_name, storage)
+        )
+        print(f"Study directory: {self.study_dir}")
+        if effective_storage and effective_storage.lower().startswith("sqlite:///"):
+            print(f"Study storage: {effective_storage} (WAL mode)")
+
         if not skip_simulation:
             self.run_simulation()
 
@@ -570,11 +630,11 @@ class INIParameterOptimizer:
 
         is_multi = directions is not None and len(directions) > 1
         study = optuna.create_study(
-            study_name=study_name,
+            study_name=effective_study_name,
             direction=directions[0] if not is_multi else None,
             directions=directions if is_multi else None,
-            storage=storage,
-            load_if_exists=True,
+            storage=effective_storage,
+            load_if_exists=load_if_exists,
             sampler=sampler,
         )
 
@@ -688,6 +748,7 @@ def main():
         sampler_name=args.sampler,
         directions=objectives,
     )
+    output_dir = optimizer.study_dir
 
     print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
@@ -706,7 +767,7 @@ def main():
             vals = ", ".join(f"{n}={v:.6f}" for n, v in zip(obj_names, t.values))
             print(f"  Trial {t.number}: {vals}")
             reconstructed = json.loads(t.user_attrs.get("reconstructed_params", "{}"))
-            best_ini = Path(args.work_dir) / f"best_reco_params_pareto_{t.number}.ini"
+            best_ini = output_dir / f"best_reco_params_pareto_{t.number}.ini"
             optimizer.update_ini_file(reconstructed or t.params, best_ini)
             print(f"    Saved to: {best_ini}")
     else:
@@ -721,7 +782,7 @@ def main():
         print("\nBest parameters (reconstructed):")
         for param, value in best_ini_params.items():
             print(f"  {param}: {value}")
-        best_ini = Path(args.work_dir) / "best_reco_params.ini"
+        best_ini = output_dir / "best_reco_params.ini"
         optimizer.update_ini_file(best_ini_params, best_ini)
         print(f"\nBest parameters saved to: {best_ini}")
 
@@ -731,9 +792,9 @@ def main():
                 study, target_names=obj_names
             )
             fig = ax.get_figure()
-            fig.savefig(Path(args.work_dir) / "pareto_front.png", dpi=150, bbox_inches="tight")
+            fig.savefig(output_dir / "pareto_front.png", dpi=150, bbox_inches="tight")
             plt.close(fig)
-            print(f"Pareto front saved to: {args.work_dir}/pareto_front.png")
+            print(f"Pareto front saved to: {output_dir}/pareto_front.png")
 
         for i, obj_name in enumerate(obj_names):
             target_fn = lambda t, i=i: t.values[i]
@@ -745,7 +806,7 @@ def main():
             fig.set_size_inches(12, 6)
             plt.tight_layout()
             fig.savefig(
-                Path(args.work_dir) / f"optimization_history_{obj_name}.png",
+                output_dir / f"optimization_history_{obj_name}.png",
                 dpi=150, bbox_inches="tight",
             )
             plt.close(fig)
@@ -757,12 +818,12 @@ def main():
             fig.set_size_inches(12, max(6, len(study.best_trials[0].params) * 0.3))
             plt.tight_layout()
             fig.savefig(
-                Path(args.work_dir) / f"param_importances_{obj_name}.png",
+                output_dir / f"param_importances_{obj_name}.png",
                 dpi=150, bbox_inches="tight",
             )
             plt.close(fig)
 
-        print(f"Per-objective plots saved to: {args.work_dir}/")
+        print(f"Per-objective plots saved to: {output_dir}/")
 
     else:
         ax = optuna.visualization.matplotlib.plot_optimization_history(study)
@@ -770,20 +831,20 @@ def main():
         fig.set_size_inches(12, 6)
         plt.tight_layout()
         fig.savefig(
-            Path(args.work_dir) / "optimization_history.png", dpi=150, bbox_inches="tight"
+            output_dir / "optimization_history.png", dpi=150, bbox_inches="tight"
         )
         plt.close(fig)
-        print(f"Optimization history saved to: {args.work_dir}/optimization_history.png")
+        print(f"Optimization history saved to: {output_dir}/optimization_history.png")
 
         ax = optuna.visualization.matplotlib.plot_param_importances(study)
         fig = ax.get_figure()
         fig.set_size_inches(12, max(6, len(study.best_params) * 0.3))
         plt.tight_layout()
         fig.savefig(
-            Path(args.work_dir) / "param_importances.png", dpi=150, bbox_inches="tight"
+            output_dir / "param_importances.png", dpi=150, bbox_inches="tight"
         )
         plt.close(fig)
-        print(f"Parameter importances saved to: {args.work_dir}/param_importances.png")
+        print(f"Parameter importances saved to: {output_dir}/param_importances.png")
 
 
 if __name__ == "__main__":
