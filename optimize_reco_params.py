@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore", message=".*is experimental.*")
 import argparse
 import importlib.util
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -26,6 +27,27 @@ import matplotlib.pyplot as plt
 
 import optuna
 from optuna.trial import Trial
+
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(
+    log_level: int = logging.INFO,
+) -> None:
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
 
 
 def load_metric_function(module_path: str) -> Callable[[str], float]:
@@ -238,6 +260,12 @@ class INIParameterOptimizer:
         study_dir.mkdir(parents=True, exist_ok=False)
         return study_dir
 
+    def _get_study_run_dir(self, study_name: str) -> Path:
+        safe_name = self._sanitize_study_name(study_name)
+        run_dir = self.work_dir / safe_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
     @staticmethod
     def _enable_sqlite_wal(db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,9 +283,8 @@ class INIParameterOptimizer:
             if normalized_storage.lower().startswith("sqlite:///"):
                 db_path = Path(os.path.expanduser(normalized_storage[10:])).resolve()
                 self._enable_sqlite_wal(db_path)
-                self.study_dir = db_path.parent
-            else:
-                self.study_dir = self.work_dir
+
+            self.study_dir = self._get_study_run_dir(study_name)
 
             return normalized_storage, study_name, True
 
@@ -276,7 +303,7 @@ class INIParameterOptimizer:
         if self.sim_done:
             return
 
-        print("Running simulation (na6psim)...")
+        logger.info("Running simulation (na6psim)...")
         generator = os.path.expandvars(
             str(self.simulation_options.get("generator", ""))
         )
@@ -298,7 +325,7 @@ class INIParameterOptimizer:
             "--load-ini",
             str(staged_layout_ini_path),
         ]
-        print(f"Executing command: {' '.join(cmd)}")
+        logger.info("Executing command: %s", " ".join(cmd))
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -309,7 +336,7 @@ class INIParameterOptimizer:
         if result.returncode != 0:
             raise RuntimeError(f"Simulation failed:\n{result.stderr}")
 
-        print("Simulation completed successfully")
+        logger.info("Simulation completed successfully")
         self.sim_done = True
 
     def _suggest_param_value(
@@ -420,7 +447,7 @@ class INIParameterOptimizer:
                 if input_dir is None:
                     updated_lines.append(line)
                 else:
-                    print(
+                    logger.warning(
                         "Warning: Overriding existing input_dir in layout INI "
                         f"for {config_dir.name} with {input_dir}"
                     )
@@ -448,7 +475,7 @@ class INIParameterOptimizer:
 
     def run_reconstruction(self, reco_ini: Path, trial_dir: Path) -> float:
         """Run reconstruction with given parameters."""
-        print(f"Running reconstruction in {trial_dir}...")
+        logger.info("Running reconstruction in %s...", trial_dir)
 
         with self._reco_lock:
             for trial_file in trial_dir.glob("*.root"):
@@ -485,13 +512,13 @@ class INIParameterOptimizer:
 
             if result.returncode != 0:
                 if result.stdout:
-                    print(f"Reconstruction output:\n{result.stdout}")
+                    logger.error("Reconstruction output:\n%s", result.stdout)
                     with open(str(trial_dir / "stdout.log"), "w") as f:
                         f.write(result.stdout)
                 if result.stderr:
-                    print(f"Reconstruction failed:\n{result.stderr}")
+                    logger.error("Reconstruction failed:\n%s", result.stderr)
                 else:
-                    print("Reconstruction failed with no stderr output.")
+                    logger.error("Reconstruction failed with no stderr output.")
                 raise optuna.TrialPruned()
 
             with open(str(trial_dir / "stdout.log"), "w") as f:
@@ -508,10 +535,10 @@ class INIParameterOptimizer:
             try:
                 metric = self.metric_function(str(trial_dir))
             except Exception as error:
-                print(f"Metric evaluation failed for {trial_dir}: {error}")
+                logger.exception("Metric evaluation failed for %s: %s", trial_dir, error)
                 raise optuna.TrialPruned()
 
-            print(f"Metric value: {metric}")
+            logger.info("Metric value: %s", metric)
             return metric
 
     def objective(self, trial: Trial, param_config: Dict[str, Any]) -> float:
@@ -571,7 +598,11 @@ class INIParameterOptimizer:
             {k: float(v) if not isinstance(v, int) else v for k, v in params.items()}
         ))
 
-        return self.run_reconstruction(trial_reco_ini, trial_dir)
+        try:
+            metric = self.run_reconstruction(trial_reco_ini, trial_dir)
+            return metric
+        finally:
+            pass
 
     def optimize(
         self,
@@ -598,9 +629,9 @@ class INIParameterOptimizer:
         effective_storage, effective_study_name, load_if_exists = (
             self._prepare_study_storage(study_name, storage)
         )
-        print(f"Study directory: {self.study_dir}")
+        logger.info("Study directory: %s", self.study_dir)
         if effective_storage and effective_storage.lower().startswith("sqlite:///"):
-            print(f"Study storage: {effective_storage} (WAL mode)")
+            logger.info("Study storage: %s (WAL mode)", effective_storage)
 
         if not skip_simulation:
             self.run_simulation()
@@ -692,6 +723,11 @@ def main():
         help="Optional Optuna storage URL (e.g., sqlite:///optuna.db)",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug-level logging",
+    )
+    parser.add_argument(
         "--skip-simulation", "-s", action="store_true",
         help="Skip the simulation step (use with pre-generated simulation data)",
     )
@@ -721,6 +757,8 @@ def main():
     )
 
     args = parser.parse_args()
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    setup_logging(log_level=log_level)
 
     param_config = load_param_ranges(args.param_ranges)
     objectives    = param_config.get("objectives", ["maximize"])
@@ -750,9 +788,9 @@ def main():
     )
     output_dir = optimizer.study_dir
 
-    print("\n" + "=" * 80)
-    print("OPTIMIZATION COMPLETE")
-    print("=" * 80)
+    logger.info("\n%s", "=" * 80)
+    logger.info("OPTIMIZATION COMPLETE")
+    logger.info("%s", "=" * 80)
 
     is_multi = len(param_config.get("objectives", ["maximize"])) > 1
     obj_names = param_config.get("objective_names", [f"obj_{i}" for i in range(len(param_config.get("objectives", ["maximize"])))])
@@ -760,31 +798,31 @@ def main():
     if is_multi:
         pareto = study.best_trials
         if not pareto:
-            print("No completed trials found. All trials were pruned or failed.")
+            logger.warning("No completed trials found. All trials were pruned or failed.")
             return
-        print(f"Pareto front: {len(pareto)} non-dominated solutions")
+        logger.info("Pareto front: %s non-dominated solutions", len(pareto))
         for t in pareto:
             vals = ", ".join(f"{n}={v:.6f}" for n, v in zip(obj_names, t.values))
-            print(f"  Trial {t.number}: {vals}")
+            logger.info("  Trial %s: %s", t.number, vals)
             reconstructed = json.loads(t.user_attrs.get("reconstructed_params", "{}"))
             best_ini = output_dir / f"best_reco_params_pareto_{t.number}.ini"
             optimizer.update_ini_file(reconstructed or t.params, best_ini)
-            print(f"    Saved to: {best_ini}")
+            logger.info("    Saved to: %s", best_ini)
     else:
         if not study.best_trials:
-            print("No completed trials found. All trials were pruned or failed.")
+            logger.warning("No completed trials found. All trials were pruned or failed.")
             return
         best_trial = study.best_trial
-        print(f"Best trial: {best_trial.number}")
-        print(f"Best metric value: {study.best_value:.6f}")
+        logger.info("Best trial: %s", best_trial.number)
+        logger.info("Best metric value: %.6f", study.best_value)
         reconstructed = json.loads(best_trial.user_attrs.get("reconstructed_params", "{}"))
         best_ini_params = reconstructed or study.best_params
-        print("\nBest parameters (reconstructed):")
+        logger.info("Best parameters (reconstructed):")
         for param, value in best_ini_params.items():
-            print(f"  {param}: {value}")
+            logger.info("  %s: %s", param, value)
         best_ini = output_dir / "best_reco_params.ini"
         optimizer.update_ini_file(best_ini_params, best_ini)
-        print(f"\nBest parameters saved to: {best_ini}")
+        logger.info("Best parameters saved to: %s", best_ini)
 
     if is_multi:
         if len(obj_names) == 2:
@@ -794,7 +832,7 @@ def main():
             fig = ax.get_figure()
             fig.savefig(output_dir / "pareto_front.png", dpi=150, bbox_inches="tight")
             plt.close(fig)
-            print(f"Pareto front saved to: {output_dir}/pareto_front.png")
+            logger.info("Pareto front saved to: %s/pareto_front.png", output_dir)
 
         for i, obj_name in enumerate(obj_names):
             target_fn = lambda t, i=i: t.values[i]
@@ -823,7 +861,7 @@ def main():
             )
             plt.close(fig)
 
-        print(f"Per-objective plots saved to: {output_dir}/")
+        logger.info("Per-objective plots saved to: %s/", output_dir)
 
     else:
         ax = optuna.visualization.matplotlib.plot_optimization_history(study)
@@ -834,7 +872,7 @@ def main():
             output_dir / "optimization_history.png", dpi=150, bbox_inches="tight"
         )
         plt.close(fig)
-        print(f"Optimization history saved to: {output_dir}/optimization_history.png")
+        logger.info("Optimization history saved to: %s/optimization_history.png", output_dir)
 
         ax = optuna.visualization.matplotlib.plot_param_importances(study)
         fig = ax.get_figure()
@@ -844,7 +882,7 @@ def main():
             output_dir / "param_importances.png", dpi=150, bbox_inches="tight"
         )
         plt.close(fig)
-        print(f"Parameter importances saved to: {output_dir}/param_importances.png")
+        logger.info("Parameter importances saved to: %s/param_importances.png", output_dir)
 
 
 if __name__ == "__main__":

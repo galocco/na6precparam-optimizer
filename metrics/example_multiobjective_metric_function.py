@@ -2,6 +2,7 @@
 Metric function for NA6P parameter optimization.
 """
 
+import logging
 import re
 from pathlib import Path
 import numpy as np
@@ -9,6 +10,7 @@ import awkward as ak
 import uproot
 
 nclusters_threshold = 4  # Minimum clusters for a track to be considered reconstructed
+logger = logging.getLogger("metrics.example_multiobjective_metric_function")
 
 def metric_function(output_dir: str) -> tuple[float, float]:
     """
@@ -36,7 +38,7 @@ def metric_function(output_dir: str) -> tuple[float, float]:
     n_trackable = 0
     n_events = len(track_ids)
 
-    print(f"Total events: {n_events}")
+    logger.info("Total events: %s", n_events)
 
     for event_tracks, event_detectors in zip(track_ids, detector_ids):
         # filter valid hits
@@ -77,7 +79,12 @@ def metric_function(output_dir: str) -> tuple[float, float]:
         if match:
             time_seconds = float(match.group(1))
 
-    print(f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}")
-    print(f"Efficiency: {efficiency:.4f}, Time/event: {time_seconds / n_events:.6f}s, Time/track: {time_seconds / n_reconstructed:.6f}s")
+    logger.info("Reconstructed: %s, Trackable: %s", n_reconstructed, n_trackable)
+    logger.info(
+        "Efficiency: %.4f, Time/event: %.6fs, Time/track: %.6fs",
+        efficiency,
+        time_seconds / n_events if n_events > 0 else 0.0,
+        time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0,
+    )
 
     return efficiency, time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0   

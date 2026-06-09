@@ -2,6 +2,7 @@
 Metric function for NA6P parameter optimization.
 """
 
+import logging
 import re
 from pathlib import Path
 import numpy as np
@@ -9,6 +10,7 @@ import awkward as ak
 import uproot
 
 nclusters_threshold = 4  # Minimum clusters for a track to be considered reconstructed
+logger = logging.getLogger("metrics.vt_eff_time_metric")
 
 def metric_function(output_dir: str) -> float:
     """
@@ -38,7 +40,7 @@ def metric_function(output_dir: str) -> float:
     n_fake = 0
     n_events = len(n_clusters)
 
-    print(f"Total events: {n_events}")
+    logger.info("Total events: %s", n_events)
 
     for i, (event_nclusters, event_partids, event_tracks, event_detectors) in enumerate(
         zip(n_clusters, n_partids, track_ids, detector_ids)
@@ -100,17 +102,22 @@ def metric_function(output_dir: str) -> float:
 
     time_per_track = time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0
 
-    print(
-        f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}, "
-        f"Fake: {n_fake}, Candidates: {n_reconstructed_candidates}"
+    logger.info(
+        "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
+        n_reconstructed,
+        n_trackable,
+        n_fake,
+        n_reconstructed_candidates,
     )
-    print(
-        f"Efficiency: {efficiency:.4f}, Time/event: {time_seconds / n_events:.6f}s, "
-        f"Time/track: {time_per_track:.6f}s"
+    logger.info(
+        "Efficiency: %.4f, Time/event: %.6fs, Time/track: %.6fs",
+        efficiency,
+        time_seconds / n_events if n_events > 0 else 0.0,
+        time_per_track,
     )
 
     metric = efficiency - time_per_track
-    print(f"Metric: {metric:.4f}")
+    logger.info("Metric: %.4f", metric)
 
     metrics_file = output_path / "metrics.txt"
     with open(metrics_file, "w") as f:

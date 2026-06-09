@@ -2,6 +2,7 @@
 Metric function for NA6P parameter optimization.
 """
 
+import logging
 import re
 from pathlib import Path
 import numpy as np
@@ -11,6 +12,7 @@ import uproot
 nclusters_threshold_vt = 4  # Minimum clusters for a track to be considered reconstructed
 nclusters_threshold_ms = 4  # Minimum clusters for a track to be considered reconstructed
 nclusters_threshold_mt = nclusters_threshold_vt + nclusters_threshold_ms # Minimum clusters for a track to be considered reconstructed
+logger = logging.getLogger("metrics.vt_ms_matching_eff_metric")
 
 def metric_function(output_dir: str) -> float:
     """
@@ -44,7 +46,7 @@ def metric_function(output_dir: str) -> float:
     n_fake = 0
     n_events = len(n_clusters_mt)
 
-    print(f"Total events: {n_events}")
+    logger.info("Total events: %s", n_events)
 
     for i, (event_nclusters_mt, event_partids_mt, event_tracks_vt, event_detectors_vt, event_tracks_ms, event_detectors_ms) in enumerate(
         zip(n_clusters_mt, n_partids_mt, track_ids_vt, detector_ids_vt, track_ids_ms, detector_ids_ms)
@@ -105,12 +107,15 @@ def metric_function(output_dir: str) -> float:
     efficiency = n_reconstructed / n_trackable if n_trackable > 0 else 0.0
 
 
-    print(
-        f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}, "
-        f"Fake: {n_fake}, Candidates: {n_reconstructed_candidates}"
+    logger.info(
+        "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
+        n_reconstructed,
+        n_trackable,
+        n_fake,
+        n_reconstructed_candidates,
     )
 
     metric = efficiency
-    print(f"Metric: {metric:.4f}")
+    logger.info("Metric: %.4f", metric)
 
     return metric
