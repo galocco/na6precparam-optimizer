@@ -1,11 +1,13 @@
 {
   "objective": ["maximize"],
   "reco_options": {
-    "doMatching": true,
     "doHitsToRecPoints": true,
+    "doDigitsToRecPoints": true,
     "doTrackletVertex": false,
     "doVTTracking": true,
-    "doMSTracking": true
+    "allowHolesInVTTracks": true,
+    "doMSTracking": false,
+    "doMatching": false
   },
   "simulation_options": {
     "generator": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")",

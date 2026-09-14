@@ -30,6 +30,7 @@ from optuna.trial import Trial
 
 
 logger = logging.getLogger(__name__)
+DEFAULT_RESULTS_DIR = (Path(__file__).resolve().parent / "results").resolve()
 
 
 def setup_logging(
@@ -188,22 +189,25 @@ class INIParameterOptimizer:
         reco_ini_template: str,
         metric_function: Callable[[str], float],
         n_events: int = 50000,
-        work_dir: str = "./optimization_work",
+        work_dir: str | Path | None = None,
         reco_options: Dict[str, Any] = None,
         simulation_options: Dict[str, Any] = None,
         monotone_increasing: bool = False,
+        n_jobs: int = 1,
     ):
         self.layout_ini = Path(layout_ini).resolve()
         self.reco_ini_template = Path(reco_ini_template).resolve()
         self.metric_function = metric_function
         self.n_events = n_events
-        self.work_dir = Path(work_dir).expanduser().resolve()
+        resolved_work_dir = DEFAULT_RESULTS_DIR if work_dir is None else Path(work_dir).expanduser().resolve()
+        self.work_dir = resolved_work_dir
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.study_dir = self.work_dir
+        self.simulation_dir = self.work_dir
         self.sim_done = False
         self._reco_lock = threading.Lock()
-        # NEW: global monotone_increasing flag (overridden per-param if set in config)
         self.monotone_increasing = monotone_increasing
+        self.n_jobs = n_jobs
 
         default_reco_options = {
             "doMatching": True,
@@ -213,6 +217,7 @@ class INIParameterOptimizer:
             "doMSTracking": True
         }
         self.reco_options: Dict[str, Any] = dict(default_reco_options)
+        
         if reco_options:
             for option_name, option_value in reco_options.items():
                 normalized_option_name = str(option_name)
@@ -285,11 +290,13 @@ class INIParameterOptimizer:
                 self._enable_sqlite_wal(db_path)
 
             self.study_dir = self._get_study_run_dir(study_name)
+            self.simulation_dir = self.study_dir
 
             return normalized_storage, study_name, True
 
         study_dir = self._create_versioned_study_dir(study_name)
         self.study_dir = study_dir
+        self.simulation_dir = study_dir.parent
         db_path = study_dir / "optuna_study.db"
         self._enable_sqlite_wal(db_path)
 
@@ -311,13 +318,16 @@ class INIParameterOptimizer:
             str(self.simulation_options.get("hook", ""))
         )
         staged_layout_ini_path = self._stage_layout_ini(
-            config_dir=self.study_dir,
+            config_dir=self.simulation_dir,
             input_dir=None,
-            output_dir=self.study_dir,
+            output_dir=self.simulation_dir,
             file_name="layout_simulation.ini",
         )
         cmd = [
-            "na6psim",
+            "na6psim_parallel",
+            "--workers",
+            str(self.n_jobs),
+            "--keep-worker-output",
             f"-n{self.n_events}",
             "-g",
             generator,
@@ -330,11 +340,24 @@ class INIParameterOptimizer:
             cmd,
             capture_output=True,
             text=True,
-            cwd=self.study_dir,
+            cwd=self.simulation_dir,
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"Simulation failed:\n{result.stderr}")
+            failure_details = result.stderr or result.stdout or ""
+            log_match = re.search(r"log:\s*(\S+)", failure_details)
+            if log_match:
+                worker_log = Path(log_match.group(1))
+                if worker_log.exists():
+                    failure_details += "\nWorker log:\n" + worker_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+            raise RuntimeError(f"Simulation failed:\n{failure_details}")
+
+        kept_worker_match = re.search(r"kept worker output:\s*(\S+)", result.stdout or "")
+        if kept_worker_match:
+            import shutil as _shutil
+            _shutil.rmtree(Path(kept_worker_match.group(1)), ignore_errors=True)
 
         logger.info("Simulation completed successfully")
         self.sim_done = True
@@ -484,7 +507,7 @@ class INIParameterOptimizer:
             reco_ini_path = Path(reco_ini).resolve()
             staged_layout_ini_path = self._stage_layout_ini(
                 config_dir=trial_dir.resolve(),
-                input_dir=self.study_dir,
+                input_dir=self.simulation_dir,
                 output_dir=trial_dir.resolve(),
                 file_name="layout_trial.ini",
             )
@@ -496,6 +519,8 @@ class INIParameterOptimizer:
                 str(reco_ini_path),
                 "--load-ini",
                 str(staged_layout_ini_path),
+                "--configKeyValues",
+                f"keyval.input_dir={self.simulation_dir};keyval.output_dir={trial_dir.resolve()}",
             ]
 
             for option_name, option_value in self.reco_options.items():
@@ -507,27 +532,47 @@ class INIParameterOptimizer:
                 cmd,
                 capture_output=True,
                 text=True,
-                cwd=self.study_dir,
+                cwd=self.simulation_dir,
+            )
+
+            command_log_path = trial_dir / "command.log"
+            stdout_log_path = trial_dir / "stdout.log"
+            stderr_log_path = trial_dir / "stderr.log"
+            reconstruction_log_path = trial_dir / "reconstruction.log"
+
+            command_log_path.write_text(
+                " ".join(cmd) + "\n",
+                encoding="utf-8",
+            )
+            stdout_log_path.write_text(result.stdout or "", encoding="utf-8")
+            stderr_log_path.write_text(result.stderr or "", encoding="utf-8")
+            reconstruction_log_path.write_text(
+                "[COMMAND]\n"
+                + " ".join(cmd)
+                + "\n\n"
+                + "[RETURN_CODE]\n"
+                + f"{result.returncode}\n\n"
+                + "[STDOUT]\n"
+                + (result.stdout or "")
+                + "\n\n"
+                + "[STDERR]\n"
+                + (result.stderr or ""),
+                encoding="utf-8",
             )
 
             if result.returncode != 0:
                 if result.stdout:
                     logger.error("Reconstruction output:\n%s", result.stdout)
-                    with open(str(trial_dir / "stdout.log"), "w") as f:
-                        f.write(result.stdout)
                 if result.stderr:
                     logger.error("Reconstruction failed:\n%s", result.stderr)
                 else:
                     logger.error("Reconstruction failed with no stderr output.")
                 raise optuna.TrialPruned()
 
-            with open(str(trial_dir / "stdout.log"), "w") as f:
-                f.write(result.stdout)
-
             # Copy simulation-only files (e.g. HitsVerTel.root, geometry.root)
             # that na6prec does not write but the metric may need.
             import shutil as _shutil
-            for work_file in self.study_dir.glob("*.root"):
+            for work_file in self.simulation_dir.glob("*.root"):
                 trial_file = trial_dir / work_file.name
                 if not trial_file.exists():
                     _shutil.copy2(work_file, trial_file)
@@ -543,7 +588,9 @@ class INIParameterOptimizer:
 
     def objective(self, trial: Trial, param_config: Dict[str, Any]) -> float:
         """Objective function for Optuna."""
-        trial_dir = self.study_dir / f"trial_{trial.number}"
+        trials_dir = self.study_dir / "trials"
+        trials_dir.mkdir(parents=True, exist_ok=True)
+        trial_dir = trials_dir / f"trial_{trial.number}"
         trial_dir.mkdir(exist_ok=True)
 
         params: Dict[str, Any] = {}
@@ -630,6 +677,7 @@ class INIParameterOptimizer:
             self._prepare_study_storage(study_name, storage)
         )
         logger.info("Study directory: %s", self.study_dir)
+        logger.info("Simulation directory: %s", self.simulation_dir)
         if effective_storage and effective_storage.lower().startswith("sqlite:///"):
             logger.info("Study storage: %s (WAL mode)", effective_storage)
 
@@ -678,13 +726,6 @@ class INIParameterOptimizer:
 
         return study
 
-
-def example_metric_function(output_dir: str) -> float:
-    """Example metric function - replace with your actual metric calculation."""
-    import random
-    return random.random()
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Optimize NA6P reconstruction parameters using Optuna"
@@ -703,8 +744,8 @@ def main():
         help="Number of simulation events (default: 100)",
     )
     parser.add_argument(
-        "--work-dir", "-d", default="./optimization_work",
-        help="Working directory (default: ./optimization_work)",
+        "--work-dir", "-d", default=str(DEFAULT_RESULTS_DIR),
+        help="Working directory (default: <repo>/results)",
     )
     parser.add_argument(
         "--study-name", default="na6p_optimization",
@@ -774,6 +815,7 @@ def main():
         reco_options=param_config.get("reco_options", {}),
         simulation_options=param_config.get("simulation_options", {}),
         monotone_increasing=args.monotone_increasing,
+        n_jobs=args.n_jobs,
     )
 
     study = optimizer.optimize(

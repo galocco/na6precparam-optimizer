@@ -1,14 +1,17 @@
 {
   "objective": ["maximize"],
   "reco_options": {
-    "doMatching": false,
     "doHitsToRecPoints": true,
+    "doDigitsToRecPoints": true,
     "doTrackletVertex": false,
     "doVTTracking": true,
-    "doMSTracking": false
+    "allowHolesInVTTracks": true,
+    "doMSTracking": false,
+    "doMatching": false
   },
   "simulation_options": {
-    "generator": "${NA6PROOT_ROOT}/share/test/genHEPMC.C+(\"/data/galocco/TheFIST_PbPb_8.77GeV_NA6PRoot/job_1/output.PbPb.8.77.C0-5.root\")",
+    //"generator": "${NA6PROOT_ROOT}/share/test/genHEPMC.C+(\"/data/galocco/TheFIST_PbPb_8.77GeV_NA6PRoot/job_1/output.PbPb.8.77.C0-5.root\")",
+    "generator": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")",
   },
   "parameters": {
     "vtNIterationsTrackerCA": {

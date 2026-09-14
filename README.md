@@ -90,16 +90,16 @@ Parameters with `iterations_param` are expanded automatically as indexed values 
     --metric-module metrics/example_metric_function.py \
     --param-ranges params/param_ranges.json \
     --n-trials 50 \
-    --work-dir ./optimization_work
+    --work-dir ./results
 ```
 
 ### 5. Check Results
 
 After completion, you'll find:
-- `optimization_work/best_reco_params.ini` - Best parameters found
-- `optimization_work/optimization_history.png` - Progress visualization
-- `optimization_work/param_importances.png` - Parameter importance plot
-- `optimization_work/trial_N/` - Individual trial outputs
+- `results/best_reco_params.ini` - Best parameters found
+- `results/optimization_history.png` - Progress visualization
+- `results/param_importances.png` - Parameter importance plot
+- `results/trial_N/` - Individual trial outputs
 
 ---
 
@@ -174,7 +174,7 @@ Optuna uses **Tree-structured Parzen Estimator (TPE)** by default, which:
 | `--reco-ini` | Path to reconstruction parameter template INI file | **Required** |
 | `--n-trials` | Number of optimization iterations (Optuna trials) | 50 |
 | `--n-events` | Number of events per simulation and reconstruction run | 10000 |
-| `--work-dir` | Working directory for trial outputs and logs | `./optimization_work` |
+| `--work-dir` | Working directory for trial outputs and logs | `<repo>/results` |
 | `--study-name` | Optuna study identifier (used for resuming studies) | `na6p_optimization` |
 | `--param-ranges` | Path to JSON file defining parameter search space | `params/param_ranges.json` |
 | `--metric-module` | Python module containing `metric_function()` for optimization | `metrics/example_metric_function.py` |

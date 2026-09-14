@@ -1,121 +1,97 @@
-"""
-Metric function for NA6P parameter optimization.
-"""
+"""Efficiency metric for matched VT/MS tracks."""
 
 import logging
-import re
+import sys
 from pathlib import Path
+
 import numpy as np
-import awkward as ak
 import uproot
 
-nclusters_threshold_vt = 4  # Minimum clusters for a track to be considered reconstructed
-nclusters_threshold_ms = 4  # Minimum clusters for a track to be considered reconstructed
-nclusters_threshold_mt = nclusters_threshold_vt + nclusters_threshold_ms # Minimum clusters for a track to be considered reconstructed
+sys.path.insert(0, str(Path(__file__).parent))
+from vt_eff_time_metric import (  # noqa: E402
+    _array_from_first_available_branch,
+    _cluster_truth_layers,
+    _label_track_id,
+)
+
+nclusters_threshold_vt = 4
+nclusters_threshold_ms = 4
+nclusters_threshold_mt = nclusters_threshold_vt + nclusters_threshold_ms
 logger = logging.getLogger("metrics.vt_ms_matching_eff_metric")
 
+
 def metric_function(output_dir: str) -> float:
-    """
-    Calculate reconstruction quality: efficiency - time_penalty
-    Returns:
-        Float to MAXIMIZE (higher = better)
-    """
+    """Return matching efficiency, with trackability based on truth layers."""
     output_path = Path(output_dir)
 
-    # Open ROOT files
-    with uproot.open(output_path / "TracksMatching.root") as f_tracks_mt, \
+    with uproot.open(output_path / "TracksMatching.root") as f_tracks, \
          uproot.open(output_path / "ClustersVerTel.root") as f_clusters_vt, \
          uproot.open(output_path / "ClustersMuonSpec.root") as f_clusters_ms:
-
-        tracks_mt = f_tracks_mt["tracksMatching;1"]
+        tracks = f_tracks["tracksMatching"]
         clusters_vt = f_clusters_vt["clustersVerTel"]
         clusters_ms = f_clusters_ms["clustersMuonSpec"]
-        # reconstructed tracks
-        n_clusters_mt = tracks_mt["Matching/Matching.mNClusters"].array(library="ak")
-        n_partids_mt = tracks_mt["Matching/Matching.mParticleID"].array(library="ak")
 
-        # cluster info
-        track_ids_vt = clusters_vt["VerTel/VerTel.mParticleID"].array(library="ak")
-        detector_ids_vt = clusters_vt["VerTel/VerTel.mLayer"].array(library="ak")
-        track_ids_ms = clusters_ms["MuonSpec/MuonSpec.mParticleID"].array(library="ak")
-        detector_ids_ms = clusters_ms["MuonSpec/MuonSpec.mLayer"].array(library="ak")
+        n_clusters = tracks["Matching/Matching.mNClusters"].array(library="np")
+        track_labels = _array_from_first_available_branch(
+            tracks,
+            ["MatchingMCTruth.mLabel", "MatchingMCTruth/MatchingMCTruth.mLabel"],
+        )
+        detector_ids_vt = clusters_vt["VerTel/VerTel.mLayer"].array(library="np")
+        detector_ids_ms = clusters_ms["MuonSpec/MuonSpec.mLayer"].array(library="np")
+
+    vt_layers = _cluster_truth_layers(
+        output_path / "ClustersVerTel.root",
+        "clustersVerTel",
+        "VerTelMCTruth",
+        detector_ids_vt,
+    )
+    ms_layers = _cluster_truth_layers(
+        output_path / "ClustersMuonSpec.root",
+        "clustersMuonSpec",
+        "MuonSpecMCTruth",
+        detector_ids_ms,
+    )
 
     n_trackable = 0
     n_reconstructed = 0
-    n_reconstructed_candidates = 0
+    n_candidates = 0
     n_fake = 0
-    n_events = len(n_clusters_mt)
+    n_events = len(n_clusters)
 
-    logger.info("Total events: %s", n_events)
-
-    for i, (event_nclusters_mt, event_partids_mt, event_tracks_vt, event_detectors_vt, event_tracks_ms, event_detectors_ms) in enumerate(
-        zip(n_clusters_mt, n_partids_mt, track_ids_vt, detector_ids_vt, track_ids_ms, detector_ids_ms)
+    for event_nclusters, event_labels, event_vt_layers, event_ms_layers in zip(
+        n_clusters, track_labels, vt_layers, ms_layers
     ):
-        if i >= n_events:
-            break
+        qualifying_labels = [
+            raw_label for raw_label, ncl in zip(event_labels, event_nclusters)
+            if ncl >= nclusters_threshold_mt
+        ]
+        candidate_ids = {
+            particle_id for raw_label in qualifying_labels
+            if (particle_id := _label_track_id(raw_label)) is not None
+        }
+        n_candidates += len(qualifying_labels)
+        n_fake += sum(_label_track_id(label) is None for label in qualifying_labels)
 
-        reconstructed_mask = (event_nclusters_mt >= nclusters_threshold_mt)
-        fake_mask = (event_nclusters_mt >= nclusters_threshold_mt) & (event_partids_mt < 0)
-        reconstructed_ids = ak.to_numpy(event_partids_mt[reconstructed_mask])
-        reconstructed_ids = np.unique(reconstructed_ids) if len(reconstructed_ids) else []
-        reconstructed_truth_ids = set(map(int, reconstructed_ids))
-        n_reconstructed_candidates += len(reconstructed_truth_ids)
-        n_fake += int(ak.sum(fake_mask))
-
-        # filter valid hits VT
-        valid_mask_vt = event_tracks_vt >= 0
-        valid_tracks_vt = event_tracks_vt[valid_mask_vt]
-        valid_detectors_vt = event_detectors_vt[valid_mask_vt]
-
-        # filter valid hits MS
-        valid_mask_ms = event_tracks_ms >= 0
-        valid_tracks_ms = event_tracks_ms[valid_mask_ms]
-
-        if len(valid_tracks_vt) == 0:
-            continue
-
-        # count VT hits per track
-        unique_tracks = np.unique(ak.to_numpy(valid_tracks_vt))
-        vt_hit_counts: dict[int, int] = {}
-        for track_id in unique_tracks:
-            mask = valid_tracks_vt == track_id
-            hit_detectors = valid_detectors_vt[mask]
-            # count only the first nclusters_threshold_vt layers
-            layers_hit = set()
-            for det_id in hit_detectors:
-                if det_id < nclusters_threshold_vt:
-                    layers_hit.add(int(det_id))
-            vt_hit_counts[int(track_id)] = len(layers_hit)
-
-        # count MS hits per track
-        ms_hit_counts: dict[int, int] = {}
-        if len(valid_tracks_ms) > 0:
-            for track_id in np.unique(ak.to_numpy(valid_tracks_ms)):
-                ms_hit_counts[int(track_id)] = int(ak.sum(valid_tracks_ms == track_id))
-
-        # a track is reconstructable if it has enough hits in BOTH detectors
-        trackable_ids = set()
-        for track_id, vt_count in vt_hit_counts.items():
-            ms_count = ms_hit_counts.get(track_id, 0)
-            if vt_count >= nclusters_threshold_vt and ms_count >= nclusters_threshold_ms:
-                trackable_ids.add(track_id)
+        vt_trackable = {
+            particle_id for particle_id, layers in event_vt_layers.items()
+            if len(layers) >= nclusters_threshold_vt
+        }
+        ms_trackable = {
+            particle_id for particle_id, layers in event_ms_layers.items()
+            if len(layers) >= nclusters_threshold_ms
+        }
+        trackable_ids = vt_trackable.intersection(ms_trackable)
 
         n_trackable += len(trackable_ids)
-        n_reconstructed += len(reconstructed_truth_ids)
+        n_reconstructed += len(candidate_ids.intersection(trackable_ids))
 
-    # efficiency
     efficiency = n_reconstructed / n_trackable if n_trackable > 0 else 0.0
-
-
     logger.info(
         "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
         n_reconstructed,
         n_trackable,
         n_fake,
-        n_reconstructed_candidates,
+        n_candidates,
     )
-
-    metric = efficiency
-    logger.info("Metric: %.4f", metric)
-
-    return metric
+    logger.info("Efficiency: %.4f", efficiency)
+    return efficiency
