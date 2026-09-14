@@ -2,11 +2,11 @@
   "objective": ["maximize"],
   "reco_options": {
     "doHitsToRecPoints": true,
-    "doDigitsToRecPoints": true,
+    "doDigitsToRecPoints": false,
     "doTrackletVertex": false,
-    "doVTTracking": true,
-    "allowHolesInVTTracks": true,
-    "doMSTracking": false,
+    "doVTTracking": false,
+    "allowHolesInVTTracks": false,
+    "doMSTracking": true,
     "doMatching": false
   },
   "simulation_options": {

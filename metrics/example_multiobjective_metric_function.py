@@ -1,90 +1,84 @@
-"""
-Metric function for NA6P parameter optimization.
-"""
+"""Multi-objective metric function for NA6P parameter optimization."""
 
 import logging
 import re
+import sys
 from pathlib import Path
-import numpy as np
-import awkward as ak
+
 import uproot
 
-nclusters_threshold = 4  # Minimum clusters for a track to be considered reconstructed
+sys.path.insert(0, str(Path(__file__).parent))
+from vt_eff_time_metric import (  # noqa: E402
+    _array_from_first_available_branch,
+    _cluster_truth_layers,
+    _label_track_id,
+)
+
+nclusters_threshold = 4
 logger = logging.getLogger("metrics.example_multiobjective_metric_function")
 
+
 def metric_function(output_dir: str) -> tuple[float, float]:
-    """
-    Calculate reconstruction quality: efficiency - time_penalty
-    Returns:
-        Float to MAXIMIZE (higher = better)
-    """
+    """Return MuonSpec efficiency and time per reconstructed track."""
     output_path = Path(output_dir)
 
-    # Open ROOT files
     with uproot.open(output_path / "TracksMuonSpec.root") as f_tracks, \
          uproot.open(output_path / "ClustersMuonSpec.root") as f_clusters:
-
         tracks = f_tracks["tracksMuonSpec"]
         clusters = f_clusters["clustersMuonSpec"]
+        n_clusters = tracks["MuonSpec/MuonSpec.mNClusters"].array(library="np")
+        track_labels = _array_from_first_available_branch(
+            tracks,
+            ["MuonSpecMCTruth.mLabel", "MuonSpecMCTruth/MuonSpecMCTruth.mLabel"],
+        )
+        detector_ids = clusters["MuonSpec/MuonSpec.mLayer"].array(library="np")
 
-        # reconstructed tracks
-        n_clusters = tracks["MuonSpec/MuonSpec.mNClusters"].array(library="ak")
-        n_reconstructed = int(ak.sum(n_clusters >= nclusters_threshold))
+    cluster_layers = _cluster_truth_layers(
+        output_path / "ClustersMuonSpec.root",
+        "clustersMuonSpec",
+        "MuonSpecMCTruth",
+        detector_ids,
+    )
 
-        # cluster info
-        track_ids = clusters["MuonSpec/MuonSpec.mParticleID"].array(library="ak")
-        detector_ids = clusters["MuonSpec/MuonSpec.mLayer"].array(library="ak")
-
-    n_trackable = 0
-    n_events = len(track_ids)
-
+    n_trackable = n_reconstructed = n_candidates = n_fake = 0
+    n_events = len(n_clusters)
     logger.info("Total events: %s", n_events)
 
-    for event_tracks, event_detectors in zip(track_ids, detector_ids):
-        # filter valid hits
-        valid_mask = event_tracks >= 0
-        valid_tracks = event_tracks[valid_mask]
-        valid_detectors = event_detectors[valid_mask]
-        if len(valid_tracks) == 0:
-            continue
+    for event_nclusters, event_labels, event_layers in zip(
+        n_clusters, track_labels, cluster_layers
+    ):
+        qualifying_labels = [
+            raw_label for raw_label, ncl in zip(event_labels, event_nclusters)
+            if ncl >= nclusters_threshold
+        ]
+        reconstructed_truth_ids = {
+            track_id for raw_label in qualifying_labels
+            if (track_id := _label_track_id(raw_label)) is not None
+        }
+        n_candidates += len(qualifying_labels)
+        n_fake += sum(_label_track_id(label) is None for label in qualifying_labels)
+        trackable_ids = {
+            particle_id for particle_id, layers in event_layers.items()
+            if len(layers) >= nclusters_threshold
+        }
+        n_trackable += len(trackable_ids)
+        n_reconstructed += len(reconstructed_truth_ids.intersection(trackable_ids))
 
-        # group by track id
-        unique_tracks = np.unique(ak.to_numpy(valid_tracks))
-        for track_id in unique_tracks:
-            mask = valid_tracks == track_id
-            hit_detectors = valid_detectors[mask]
-
-            # build layer mask
-            layer_mask = 0
-            # use only the first nclusters_threshold layers to determine trackability
-            for det_id in hit_detectors:
-                if det_id - 5 >= nclusters_threshold:
-                    continue
-                layer = int(det_id) - 5  # 0-based (5-10 → 0-5)
-                layer_mask |= (1 << layer)
-
-            # full coverage
-            if layer_mask >= (1 << nclusters_threshold) - 1:
-                n_trackable += 1
-
-    # efficiency
     efficiency = n_reconstructed / n_trackable if n_trackable > 0 else 0.0
-
-    # read timing
     time_seconds = 0.0
     log_path = output_path / "stdout.log"
     if log_path.exists():
-        log = log_path.read_text()
-        match = re.search(r"CP time\s+([0-9.]+)", log)
+        match = re.search(r"CP time\s+([0-9.]+)", log_path.read_text())
         if match:
             time_seconds = float(match.group(1))
+    time_per_track = time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0
 
-    logger.info("Reconstructed: %s, Trackable: %s", n_reconstructed, n_trackable)
+    logger.info(
+        "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
+        n_reconstructed, n_trackable, n_fake, n_candidates,
+    )
     logger.info(
         "Efficiency: %.4f, Time/event: %.6fs, Time/track: %.6fs",
-        efficiency,
-        time_seconds / n_events if n_events > 0 else 0.0,
-        time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0,
+        efficiency, time_seconds / n_events if n_events > 0 else 0.0, time_per_track,
     )
-
-    return efficiency, time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0   
+    return efficiency, time_per_track

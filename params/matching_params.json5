@@ -6,8 +6,8 @@
     "doTrackletVertex": false,
     "doVTTracking": true,
     "allowHolesInVTTracks": true,
-    "doMSTracking": false,
-    "doMatching": false
+    "doMSTracking": true,
+    "doMatching": true
   },
   "simulation_options": {
     "generator": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")",
