@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -144,6 +145,21 @@ def load_param_ranges(config_path: str) -> Dict[str, Any]:
     normalized["objectives"] = objectives
 
     return normalized
+
+
+def save_run_command(output_dir: Path, args: argparse.Namespace) -> Path:
+    """Save the exact invocation and parsed CLI settings for this optimization."""
+    command_path = output_dir / "run_command.txt"
+    command = shlex.join([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+    settings = json.dumps(vars(args), indent=2, sort_keys=True)
+    command_path.write_text(
+        "Command:\n"
+        f"{command}\n\n"
+        "Parsed settings:\n"
+        f"{settings}\n",
+        encoding="utf-8",
+    )
+    return command_path
 
 
 def _normalize_param_spec(param_name: str, spec: Any) -> Dict[str, Any]:
@@ -317,12 +333,6 @@ class INIParameterOptimizer:
         hook = os.path.expandvars(
             str(self.simulation_options.get("hook", ""))
         )
-        staged_layout_ini_path = self._stage_layout_ini(
-            config_dir=self.simulation_dir,
-            input_dir=None,
-            output_dir=self.simulation_dir,
-            file_name="layout_simulation.ini",
-        )
         cmd = [
             "na6psim_parallel",
             "--workers",
@@ -333,7 +343,7 @@ class INIParameterOptimizer:
             generator,
             *([f"-u{hook}"] if hook else []),
             "--load-ini",
-            str(staged_layout_ini_path),
+            str(self.layout_ini),
         ]
         logger.info("Executing command: %s", " ".join(cmd))
         result = subprocess.run(
@@ -360,6 +370,11 @@ class INIParameterOptimizer:
             _shutil.rmtree(Path(kept_worker_match.group(1)), ignore_errors=True)
 
         logger.info("Simulation completed successfully")
+        generated_layout = self.simulation_dir / "na6pLayout.ini"
+        if not generated_layout.exists():
+            raise FileNotFoundError(
+                f"na6psim completed but did not create the expected layout: {generated_layout}"
+            )
         self.sim_done = True
 
     def _suggest_param_value(
@@ -505,12 +520,12 @@ class INIParameterOptimizer:
                 trial_file.unlink()
 
             reco_ini_path = Path(reco_ini).resolve()
-            staged_layout_ini_path = self._stage_layout_ini(
-                config_dir=trial_dir.resolve(),
-                input_dir=self.simulation_dir,
-                output_dir=trial_dir.resolve(),
-                file_name="layout_trial.ini",
-            )
+            generated_layout = self.simulation_dir / "na6pLayout.ini"
+            if not generated_layout.exists():
+                raise FileNotFoundError(
+                    f"Generated simulation layout not found: {generated_layout}. "
+                    "Run the simulation before reconstruction."
+                )
 
             cmd = [
                 "na6prec",
@@ -518,7 +533,7 @@ class INIParameterOptimizer:
                 "--load-recoparam",
                 str(reco_ini_path),
                 "--load-ini",
-                str(staged_layout_ini_path),
+                str(generated_layout),
                 "--configKeyValues",
                 f"keyval.input_dir={self.simulation_dir};keyval.output_dir={trial_dir.resolve()}",
             ]
@@ -829,6 +844,8 @@ def main():
         directions=objectives,
     )
     output_dir = optimizer.study_dir
+    command_path = save_run_command(output_dir, args)
+    logger.info("Run command and settings saved to: %s", command_path)
 
     logger.info("\n%s", "=" * 80)
     logger.info("OPTIMIZATION COMPLETE")
