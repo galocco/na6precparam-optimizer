@@ -170,8 +170,8 @@ Optuna uses **Tree-structured Parzen Estimator (TPE)** by default, which:
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--layout-ini` | Path to NA6P layout configuration INI file | **Required** |
-| `--reco-ini` | Path to reconstruction parameter template INI file | **Required** |
+| `--layout-ini` | Optional path to layout configuration INI file; omitted means `na6psim` defaults | None |
+| `--reco-ini` | Optional path to reconstruction parameter template; omitted means `na6prec` defaults | None |
 | `--n-trials` | Number of optimization iterations (Optuna trials) | 50 |
 | `--n-events` | Number of events per simulation and reconstruction run | 10000 |
 | `--work-dir` | Working directory for trial outputs and logs | `<repo>/results` |
@@ -179,6 +179,18 @@ Optuna uses **Tree-structured Parzen Estimator (TPE)** by default, which:
 | `--param-ranges` | Path to JSON file defining parameter search space | `params/param_ranges.json` |
 | `--metric-module` | Python module containing `metric_function()` for optimization | `metrics/example_metric_function.py` |
 | `--storage` | Database URL for Optuna (SQLite, PostgreSQL, etc.) | None (in-memory; lost after run) |
+| `--n-jobs` | Number of concurrent reconstruction trials and simulation workers | 1 |
+| `--save` | Delete ROOT files from each trial directory after metric evaluation | Disabled |
+
+Each reconstruction runs with its trial directory as the working directory.
+Large simulation inputs (hits, digits, MC particles, and geometry) are linked
+into that directory. Precomputed reconstruction files are copied so trials can
+rewrite them independently. Keep the simulation files available while running
+trials or inspecting their linked inputs. `--save` removes these links and the
+generated ROOT files from the trial directory without deleting shared inputs.
+Metric evaluation is serialized because the supplied metrics use PyROOT plotting
+state; reconstruction processes run concurrently. Logs report reconstruction
+elapsed time, metric evaluation time, and time waiting for metric evaluation.
 
 ### Example Configurations
 
@@ -402,4 +414,3 @@ For compatibility with the current script, encode these ranges in `params/param_
 - [Optuna Documentation](https://optuna.readthedocs.io/)
 - [Optuna Tutorial](https://optuna.readthedocs.io/en/stable/tutorial/index.html)
 - [Hyperparameter Optimization](https://en.wikipedia.org/wiki/Hyperparameter_optimization)
-

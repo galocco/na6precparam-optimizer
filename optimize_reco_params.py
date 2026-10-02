@@ -18,10 +18,12 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict
 import matplotlib.pyplot as plt
@@ -201,18 +203,21 @@ class INIParameterOptimizer:
 
     def __init__(
         self,
-        layout_ini: str,
-        reco_ini_template: str,
+        layout_ini: str | None,
+        reco_ini_template: str | None,
         metric_function: Callable[[str], float],
         n_events: int = 50000,
         work_dir: str | Path | None = None,
         reco_options: Dict[str, Any] = None,
         simulation_options: Dict[str, Any] = None,
-        monotone_increasing: bool = False,
         n_jobs: int = 1,
+        save: bool = False,
     ):
-        self.layout_ini = Path(layout_ini).resolve()
-        self.reco_ini_template = Path(reco_ini_template).resolve()
+        self.layout_ini = Path(layout_ini).expanduser().resolve() if layout_ini else None
+        self.reco_ini_template = (
+            Path(reco_ini_template).expanduser().resolve()
+            if reco_ini_template else None
+        )
         self.metric_function = metric_function
         self.n_events = n_events
         resolved_work_dir = DEFAULT_RESULTS_DIR if work_dir is None else Path(work_dir).expanduser().resolve()
@@ -221,9 +226,11 @@ class INIParameterOptimizer:
         self.study_dir = self.work_dir
         self.simulation_dir = self.work_dir
         self.sim_done = False
-        self._reco_lock = threading.Lock()
-        self.monotone_increasing = monotone_increasing
+        # Metrics may use PyROOT plotting globals, which cannot be shared safely
+        # by the Optuna worker threads. Reconstruction runs in separate processes.
+        self._metric_lock = threading.Lock()
         self.n_jobs = n_jobs
+        self.save = save
 
         default_reco_options = {
             "doMatching": True,
@@ -250,9 +257,9 @@ class INIParameterOptimizer:
             for option_name, option_value in simulation_options.items():
                 self.simulation_options[str(option_name)] = option_value
 
-        if not self.layout_ini.exists():
+        if self.layout_ini is not None and not self.layout_ini.exists():
             raise FileNotFoundError(f"Layout INI not found: {self.layout_ini}")
-        if not self.reco_ini_template.exists():
+        if self.reco_ini_template is not None and not self.reco_ini_template.exists():
             raise FileNotFoundError(
                 f"Reco INI template not found: {self.reco_ini_template}"
             )
@@ -342,9 +349,9 @@ class INIParameterOptimizer:
             "-g",
             generator,
             *([f"-u{hook}"] if hook else []),
-            "--load-ini",
-            str(self.layout_ini),
         ]
+        if self.layout_ini is not None:
+            cmd.extend(["--load-ini", str(self.layout_ini)])
         logger.info("Executing command: %s", " ".join(cmd))
         result = subprocess.run(
             cmd,
@@ -444,6 +451,10 @@ class INIParameterOptimizer:
 
     def update_ini_file(self, params: Dict[str, Any], output_path: Path):
         """Update INI file with new parameter values."""
+        if self.reco_ini_template is None:
+            output_path.write_text("", encoding="utf-8")
+            return
+
         with open(self.reco_ini_template, "r", encoding="utf-8") as file_handle:
             lines = file_handle.readlines()
 
@@ -511,95 +522,127 @@ class INIParameterOptimizer:
 
         return staged_layout_ini_path
 
-    def run_reconstruction(self, reco_ini: Path, trial_dir: Path) -> float:
-        """Run reconstruction with given parameters."""
-        logger.info("Running reconstruction in %s...", trial_dir)
+    def _prepare_trial_inputs(self, trial_dir: Path) -> None:
+        """Expose simulation inputs without sharing writable reconstruction files."""
+        for trial_file in trial_dir.glob("*.root"):
+            # Unlinking a simulation input symlink leaves its source intact.
+            trial_file.unlink()
 
-        with self._reco_lock:
-            for trial_file in trial_dir.glob("*.root"):
-                trial_file.unlink()
-
-            reco_ini_path = Path(reco_ini).resolve()
-            generated_layout = self.simulation_dir / "na6pLayout.ini"
-            if not generated_layout.exists():
-                raise FileNotFoundError(
-                    f"Generated simulation layout not found: {generated_layout}. "
-                    "Run the simulation before reconstruction."
-                )
-
-            cmd = [
-                "na6prec",
-                f"-l{self.n_events}",
-                "--load-recoparam",
-                str(reco_ini_path),
-                "--load-ini",
-                str(generated_layout),
-                "--configKeyValues",
-                f"keyval.input_dir={self.simulation_dir};keyval.output_dir={trial_dir.resolve()}",
-            ]
-
-            for option_name, option_value in self.reco_options.items():
-                cmd.extend(
-                    [f"--{option_name}", self._format_cli_option_value(option_value)]
-                )
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=self.simulation_dir,
-            )
-
-            command_log_path = trial_dir / "command.log"
-            stdout_log_path = trial_dir / "stdout.log"
-            stderr_log_path = trial_dir / "stderr.log"
-            reconstruction_log_path = trial_dir / "reconstruction.log"
-
-            command_log_path.write_text(
-                " ".join(cmd) + "\n",
-                encoding="utf-8",
-            )
-            stdout_log_path.write_text(result.stdout or "", encoding="utf-8")
-            stderr_log_path.write_text(result.stderr or "", encoding="utf-8")
-            reconstruction_log_path.write_text(
-                "[COMMAND]\n"
-                + " ".join(cmd)
-                + "\n\n"
-                + "[RETURN_CODE]\n"
-                + f"{result.returncode}\n\n"
-                + "[STDOUT]\n"
-                + (result.stdout or "")
-                + "\n\n"
-                + "[STDERR]\n"
-                + (result.stderr or ""),
-                encoding="utf-8",
-            )
-
-            if result.returncode != 0:
-                if result.stdout:
-                    logger.error("Reconstruction output:\n%s", result.stdout)
-                if result.stderr:
-                    logger.error("Reconstruction failed:\n%s", result.stderr)
+        for simulation_file in self.simulation_dir.iterdir():
+            if not simulation_file.is_file():
+                continue
+            trial_file = trial_dir / simulation_file.name
+            if simulation_file.suffix.lower() == ".root":
+                if (
+                    simulation_file.name in {"MCKine.root", "geometry.root"}
+                    or simulation_file.name.startswith(("Hits", "Digits"))
+                ):
+                    # These files are only read by na6prec and by the metrics.
+                    trial_file.symlink_to(simulation_file.resolve())
                 else:
-                    logger.error("Reconstruction failed with no stderr output.")
-                raise optuna.TrialPruned()
+                    # Precomputed clusters/tracks can be inputs when a stage is
+                    # disabled. Keep a private copy in case na6prec rewrites them.
+                    shutil.copy2(simulation_file, trial_file)
+            elif simulation_file.suffix.lower() in {".txt", ".dat", ".inp", ".gdml"}:
+                # Preserve relative field-map/resource paths from the layout.
+                shutil.copy2(simulation_file, trial_file)
 
-            # Copy simulation-only files (e.g. HitsVerTel.root, geometry.root)
-            # that na6prec does not write but the metric may need.
-            import shutil as _shutil
-            for work_file in self.simulation_dir.glob("*.root"):
-                trial_file = trial_dir / work_file.name
-                if not trial_file.exists():
-                    _shutil.copy2(work_file, trial_file)
+    def run_reconstruction(self, reco_ini: Path, trial_dir: Path) -> float:
+        """Run reconstruction in a private working directory for this trial."""
+        trial_dir = trial_dir.resolve()
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        reco_ini_path = Path(reco_ini).resolve()
+        generated_layout = self.simulation_dir / "na6pLayout.ini"
+        if not generated_layout.exists():
+            raise FileNotFoundError(
+                f"Generated simulation layout not found: {generated_layout}. "
+                "Run the simulation before reconstruction."
+            )
 
-            try:
+        self._prepare_trial_inputs(trial_dir)
+        cmd = [
+            "na6prec",
+            f"-l{self.n_events}",
+            "--load-ini",
+            str(generated_layout),
+            "--configKeyValues",
+            f"keyval.input_dir={trial_dir};keyval.output_dir={trial_dir}",
+        ]
+
+        if self.reco_ini_template is not None:
+            cmd[2:2] = ["--load-recoparam", str(reco_ini_path)]
+
+        for option_name, option_value in self.reco_options.items():
+            cmd.extend(
+                [f"--{option_name}", self._format_cli_option_value(option_value)]
+            )
+
+        logger.info("Running reconstruction in %s...", trial_dir)
+        reconstruction_start = time.perf_counter()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=trial_dir,
+        )
+        logger.info(
+            "Reconstruction in %s completed in %.3fs",
+            trial_dir, time.perf_counter() - reconstruction_start,
+        )
+
+        command_log_path = trial_dir / "command.log"
+        stdout_log_path = trial_dir / "stdout.log"
+        stderr_log_path = trial_dir / "stderr.log"
+        reconstruction_log_path = trial_dir / "reconstruction.log"
+        command = shlex.join(cmd)
+
+        command_log_path.write_text(command + "\n", encoding="utf-8")
+        stdout_log_path.write_text(result.stdout or "", encoding="utf-8")
+        stderr_log_path.write_text(result.stderr or "", encoding="utf-8")
+        reconstruction_log_path.write_text(
+            "[COMMAND]\n"
+            + command
+            + "\n\n"
+            + "[RETURN_CODE]\n"
+            + f"{result.returncode}\n\n"
+            + "[STDOUT]\n"
+            + (result.stdout or "")
+            + "\n\n"
+            + "[STDERR]\n"
+            + (result.stderr or ""),
+            encoding="utf-8",
+        )
+
+        if result.returncode != 0:
+            if result.stdout:
+                logger.error("Reconstruction output:\n%s", result.stdout)
+            if result.stderr:
+                logger.error("Reconstruction failed:\n%s", result.stderr)
+            else:
+                logger.error("Reconstruction failed with no stderr output.")
+            raise optuna.TrialPruned()
+
+        try:
+            wait_start = time.perf_counter()
+            with self._metric_lock:
+                metric_start = time.perf_counter()
                 metric = self.metric_function(str(trial_dir))
-            except Exception as error:
-                logger.exception("Metric evaluation failed for %s: %s", trial_dir, error)
-                raise optuna.TrialPruned()
+                logger.info(
+                    "Metric evaluation in %s completed in %.3fs (waited %.3fs)",
+                    trial_dir, time.perf_counter() - metric_start,
+                    metric_start - wait_start,
+                )
+        except Exception as error:
+            logger.exception("Metric evaluation failed for %s: %s", trial_dir, error)
+            raise optuna.TrialPruned()
+        finally:
+            if self.save:
+                for trial_file in trial_dir.glob("*.root"):
+                    trial_file.unlink()
+                logger.debug("Removed ROOT files from %s", trial_dir)
 
-            logger.info("Metric value: %s", metric)
-            return metric
+        logger.info("Metric value: %s", metric)
+        return metric
 
     def objective(self, trial: Trial, param_config: Dict[str, Any]) -> float:
         """Objective function for Optuna."""
@@ -635,7 +678,9 @@ class INIParameterOptimizer:
                     f"Iteration count for '{param_name}' must be non-negative"
                 )
 
-            use_monotone = spec.get("monotone_increasing", self.monotone_increasing)
+            # Configure monotonicity independently for each parameter in the
+            # JSON/JSON5 parameter specification.
+            use_monotone = bool(spec.get("monotone_increasing", False))
 
             if use_monotone:
                 indexed_params = self._suggest_monotone_increasing_values(
@@ -683,8 +728,9 @@ class INIParameterOptimizer:
             sampler_name: Which Optuna sampler to use. Choices:
                 - "tpe"  (default) — TPESampler, handles dynamic search spaces well.
                 - "cmaes"          — CmaEsSampler, good for continuous spaces; requires
-                                     monotone_increasing=True (fixed [0,1] bounds) to
-                                     avoid independent-sampling fallback warnings.
+                                     parameters marked monotone_increasing in the
+                                     JSON (fixed [0,1] bounds) to avoid
+                                     independent-sampling fallback warnings.
                 - "random"         — RandomSampler, useful as a baseline.
                 - "nsga2"          — NSGAIISampler (multi-objective capable).
         """
@@ -745,10 +791,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Optimize NA6P reconstruction parameters using Optuna"
     )
-    parser.add_argument("--layout-ini", "-l", required=True, help="Path to layout INI file")
     parser.add_argument(
-        "--reco-ini", "-r", required=True,
-        help="Path to reconstruction parameter INI file (template)",
+        "--layout-ini", "-l", default=None,
+        help="Optional path to layout INI file (otherwise na6psim uses its defaults)",
+    )
+    parser.add_argument(
+        "--reco-ini", "-r", default=None,
+        help="Optional path to reconstruction parameter INI file (otherwise na6prec uses its defaults)",
     )
     parser.add_argument(
         "--n-trials", "-t", type=int, default=10,
@@ -797,19 +846,14 @@ def main():
         choices=["tpe", "cmaes", "random", "nsga2"],
         help=(
             "Optuna sampler to use (default: tpe). "
-            "Use 'cmaes' together with --monotone-increasing for best results: "
+            "Use 'cmaes' with parameters marked 'monotone_increasing' in the JSON: "
             "the fixed [0,1] percentage encoding avoids dynamic-search-space warnings."
         ),
     )
     parser.add_argument(
-        "--monotone-increasing",
+        "--save",
         action="store_true",
-        default=False,
-        help=(
-            "Force all iterated parameters to be monotonically non-decreasing "
-            "across iterations. Can also be set per-parameter in the config file "
-            "via 'monotone_increasing': true."
-        ),
+        help="Delete ROOT files from each trial directory after metric evaluation",
     )
 
     args = parser.parse_args()
@@ -829,8 +873,8 @@ def main():
         work_dir=args.work_dir,
         reco_options=param_config.get("reco_options", {}),
         simulation_options=param_config.get("simulation_options", {}),
-        monotone_increasing=args.monotone_increasing,
         n_jobs=args.n_jobs,
+        save=args.save,
     )
 
     study = optimizer.optimize(
