@@ -1,4 +1,4 @@
-"""Metric function for NA6P parameter optimization."""
+"""Multi-objective metric function for NA6P parameter optimization."""
 
 import logging
 import fcntl
@@ -11,7 +11,7 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).parent))
 from metric_helpers import (
     append_kinematics, delta_electrons_by_mother, eligible_muon_ids,
-    record_truth_kinematics, cpu_seconds,
+    record_truth_kinematics,
 )  # noqa: E402
 from vt_multiobjective_metric_function import (  # noqa: E402
     _array_from_first_available_branch,
@@ -22,12 +22,12 @@ from vt_multiobjective_metric_function import (  # noqa: E402
 import numpy as np
 import uproot
 
-nclusters_threshold = 4
+nclusters_threshold = 6
 first_muonspec_layer = 5
 accepted_mother_pdgs = {443, 223, 221, 333, 23}  # J/psi, omega, eta, phi, Z
-OBJECTIVE_DIRECTIONS = ("maximize",)
-OBJECTIVE_NAMES = ("efficiency minus time penalty",)
-logger = logging.getLogger("metrics.ms_metric_function")
+OBJECTIVE_DIRECTIONS = ("maximize", "minimize")
+OBJECTIVE_NAMES = ("efficiency", "fraction of non muon matched")
+logger = logging.getLogger("metrics.mid_matching_eff_metric")
 
 
 def _truth_key(raw_label: int) -> int | None:
@@ -249,8 +249,8 @@ def _mean_bin_efficiency(output_path: Path, denominator: dict[str, list[float]],
     return float(eff[filled].mean()) if filled.any() else 0.0
 
 
-def metric_function(output_dir: str) -> float:
-    """Calculate MuonSpec efficiency minus the time penalty."""
+def metric_function(output_dir: str) -> tuple[float, float]:
+    """Return MuonSpec efficiency and the matched fraction of non-muon tracks."""
     output_path = Path(output_dir)
 
     with uproot.open(output_path / "TracksMuonSpec.root") as f_tracks, \
@@ -266,6 +266,7 @@ def metric_function(output_dir: str) -> float:
             "MuonSpec/MuonSpec.mClusterIndices[16]"
         ].array(library="np")
         track_params = tracks["MuonSpec/MuonSpec.mP[5]"].array(library="np")
+        track_statuses = tracks["MuonSpec/MuonSpec.mStatusMS"].array(library="np")
         detector_ids = clusters["MuonSpec/MuonSpec.mLayer"].array(library="np")
 
     cluster_layers, cluster_labels = _cluster_truth_data(
@@ -280,6 +281,7 @@ def metric_function(output_dir: str) -> float:
         first_muonspec_layer, first_muonspec_layer + nclusters_threshold
     ))
     n_trackable = n_reconstructed = n_candidates = n_fake = 0
+    n_matched_non_muons = n_tracked_non_muons = 0
     trackable_kinematics = {name: [] for name in ("p", "pt", "y")}
     reconstructed_kinematics = {name: [] for name in ("p", "pt", "y")}
     candidate_kinematics = {name: [] for name in ("p", "pt", "y")}
@@ -290,11 +292,12 @@ def metric_function(output_dir: str) -> float:
     with uproot.open(output_path / "MCKine.root") as f_kine:
         kine = f_kine["mckine"]
         if not (n_events == len(track_labels) == len(track_cluster_indices) == len(track_params)
+                == len(track_statuses)
                 == len(cluster_layers) == len(cluster_labels) == len(detector_ids)) or kine.num_entries < n_events:
             raise ValueError("MuonSpec tracks, clusters, and MC events are misaligned")
 
-        for event_nclusters, event_labels, event_indices, event_params, event_layers, event_cluster_labels, event_detector_ids, particle_data in zip(
-            n_clusters, track_labels, track_cluster_indices, track_params, cluster_layers,
+        for event_nclusters, event_labels, event_indices, event_params, event_statuses, event_layers, event_cluster_labels, event_detector_ids, particle_data in zip(
+            n_clusters, track_labels, track_cluster_indices, track_params, track_statuses, cluster_layers,
             cluster_labels, detector_ids,
             _mc_events(output_path / "MCKine.root", n_events),
             strict=True,
@@ -313,6 +316,14 @@ def metric_function(output_dir: str) -> float:
                 if (key := _truth_key(raw_label)) is not None
             }
             pdg, mothers, momentum = particle_data
+            for raw_label, status in zip(event_labels, event_statuses, strict=True):
+                truth_key = _truth_key(raw_label)
+                particle_id = truth_key & ((1 << 31) - 1) if truth_key is not None else None
+                if (particle_id is not None and particle_id < len(pdg)
+                        and abs(int(pdg[particle_id])) != 13):
+                    n_tracked_non_muons += 1
+                    if int(status) in (4, 5):
+                        n_matched_non_muons += 1
             eligible_ids = eligible_muon_ids(pdg, mothers, accepted_mother_pdgs)
             delta_by_mother = delta_electrons_by_mother(pdg, mothers, main_ids)
 
@@ -355,23 +366,18 @@ def metric_function(output_dir: str) -> float:
         output_path, trackable_kinematics, reconstructed_kinematics,
         "muon_efficiency_pt_vs_y.png",
     )
-    time_seconds = cpu_seconds(output_path)
-    time_per_track = time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0
-
-    time_per_event = time_seconds / n_events if n_events else 0.0
-
+    non_muon_match_fraction = (
+        n_matched_non_muons / n_tracked_non_muons if n_tracked_non_muons else 0.0
+    )
     logger.info(
-        "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
+        "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s, Matched non-muons: %s, Tracked non-muons: %s",
         n_reconstructed, n_trackable, n_fake, n_candidates,
+        n_matched_non_muons, n_tracked_non_muons,
     )
     logger.info(
-        "Efficiency (bin-averaged): %.4f, global: %.4f, Time/event: %.6fs, Time/track: %.6fs",
-        efficiency, efficiency_global,
-        time_per_event, time_per_track,
+        "Efficiency (bin-averaged): %.4f, global: %.4f, Non-muon match fraction: %.4f",
+        efficiency, efficiency_global, non_muon_match_fraction,
     )
-    metric = efficiency - time_per_track
-    logger.info("Metric: %.4f", metric)
-
     with open(output_path / "metrics.txt", "w") as metrics_file:
         metrics_file.write(
             f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}, "
@@ -379,7 +385,8 @@ def metric_function(output_dir: str) -> float:
         )
         metrics_file.write(
             f"Efficiency: {efficiency:.4f}, Efficiency (global): {efficiency_global:.4f}, "
-            f"Time/event: {time_per_event:.6f}s, "
-            f"Time/track: {time_per_track:.6f}s\n"
+            f"Matched non-muons: {n_matched_non_muons}, "
+            f"Tracked non-muons: {n_tracked_non_muons}, "
+            f"Non-muon match fraction: {non_muon_match_fraction:.4f}\n"
         )
-    return metric
+    return efficiency, non_muon_match_fraction

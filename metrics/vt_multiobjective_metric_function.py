@@ -1,85 +1,136 @@
-"""Multi-objective metric function for NA6P parameter optimization."""
+"""
+Metric function for NA6P parameter optimization.
+"""
 
 import logging
 import fcntl
 import hashlib
 import os
-import sys
 from pathlib import Path
 import subprocess
-
-sys.path.insert(0, str(Path(__file__).parent))
-from metric_helpers import (
-    append_kinematics, delta_electrons_by_mother, eligible_muon_ids,
-    record_truth_kinematics, cpu_seconds,
-)  # noqa: E402
-from vt_multiobjective_metric_function import (  # noqa: E402
-    _array_from_first_available_branch,
-    _cluster_truth_data,
-    _label_track_id,
-)
-
+import sys
 import numpy as np
 import uproot
 
-nclusters_threshold = 4
-first_muonspec_layer = 5
-accepted_mother_pdgs = {443, 223, 221, 333, 23}  # J/psi, omega, eta, phi, Z
+sys.path.insert(0, str(Path(__file__).parent))
+from metric_helpers import append_kinematics, cpu_seconds, record_truth_kinematics  # noqa: E402
+
+nclusters_threshold = 4  # Minimum clusters for a track to be considered reconstructed
 OBJECTIVE_DIRECTIONS = ("maximize", "minimize")
 OBJECTIVE_NAMES = ("efficiency", "CPU time per reconstructed track (s)")
-logger = logging.getLogger("metrics.ms_multiobjective_metric_function")
+logger = logging.getLogger("metrics.vt_multiobjective_metric_function")
 
 
-def _truth_key(raw_label: int) -> int | None:
-    """Identify a particle including its event and source, ignoring the fake bit."""
-    raw_label = int(raw_label)
-    if raw_label in (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFE):
+def _reco_kinematics(params: np.ndarray) -> dict[str, float] | None:
+    """Estimate fitted p, pT, and y (using a pion mass for rapidity)."""
+    tx, ty, q_over_pxz = map(float, params[2:5])
+    if not np.isfinite([tx, ty, q_over_pxz]).all() or q_over_pxz == 0 or abs(tx) > 1:
         return None
-    return raw_label & ((1 << 58) - 1)
+    pxz = 1.0 / abs(q_over_pxz)
+    px, py = tx * pxz, ty * pxz
+    pz = np.sqrt(1.0 - tx * tx) * pxz
+    pt = float(np.hypot(px, py))
+    return {
+        "p": float(np.hypot(pt, pz)),
+        "pt": pt,
+        "y": float(np.arcsinh(pz / np.hypot(pt, 0.13957039))),
+    }
 
 
-def _track_has_wrong_hit(
-    raw_label: int,
-    cluster_indices: np.ndarray,
-    n_clusters: int,
-    cluster_labels: list[tuple[int, ...]],
-    delta_by_mother: dict[int, set[int]],
-) -> bool:
-    main_key = _truth_key(raw_label)
-    if main_key is None:
-        return True
+def _array_from_first_available_branch(tree: uproot.TTree, candidates: list[str]) -> np.ndarray:
+    available_keys = set(tree.keys())
+    for branch_name in candidates:
+        if branch_name in available_keys:
+            return tree[branch_name].array(library="np")
 
-    main_id = main_key & ((1 << 31) - 1)
-    origin = main_key & ~((1 << 31) - 1)
-    # A hit from the particle's own delta electron is valid. A delta electron
-    # produced by another particle has a different mother and remains invalid.
-    allowed = {main_key}
-    allowed.update(origin | delta_id for delta_id in delta_by_mother.get(main_id, ()))
-
-    associated = [int(index) for index in cluster_indices if index >= 0]
-    if len(associated) != n_clusters:
-        return True
-    for index in associated:
-        if index >= len(cluster_labels):
-            return True
-        labels = cluster_labels[index]
-        if not labels or any(_truth_key(label) not in allowed for label in labels):
-            return True
-    return False
+    preview = ", ".join(sorted(available_keys)[:12])
+    raise KeyError(
+        f"None of branches {candidates} found in tree '{tree.object_path}'. "
+        f"Available keys (first 12): {preview}"
+    )
 
 
-def _has_required_layers(
-    cluster_indices: np.ndarray,
-    n_clusters: int,
+def _label_track_id(raw_label: int) -> int | None:
+    """Decode the MC track id from NA6PMCComposedLabel's raw value."""
+    raw_label = int(raw_label)
+    if raw_label == 0xFFFFFFFFFFFFFFFF or raw_label == 0xFFFFFFFFFFFFFFFE:
+        return None  # unset/noise
+    if raw_label & (1 << 63):
+        return None  # fake label
+    return raw_label & ((1 << 31) - 1)
+
+
+def _cluster_truth_data(
+    tree_path: Path,
+    tree_name: str,
+    truth_branch: str,
     detector_ids: np.ndarray,
-    required_layers: set[int],
-) -> bool:
-    """Require a track cluster in each of the first MuonSpec layers."""
-    associated = [int(index) for index in cluster_indices if index >= 0]
-    if len(associated) != n_clusters or any(index >= len(detector_ids) for index in associated):
-        return False
-    layers = {int(detector_ids[index]) for index in associated}
-    return required_layers.issubset(layers)
+    include_labels: bool = False,
+) -> tuple[list[dict[int, set[int]]], list[list[tuple[int, ...]]]]:
+    """Read cluster truth with ROOT's native streamer.
+
+    uproot cannot deserialize the vector of NA6PMCComposedLabel in the custom
+    NA6PMCTruthContainer. The small reader is compiled once and then reused.
+    """
+    source = Path(__file__).with_name("cluster_truth_reader.cc")
+    install_root = os.environ.get("NA6PROOT_ROOT")
+    if not install_root:
+        raise RuntimeError("NA6PROOT_ROOT must point to the NA6P installation")
+    install = Path(install_root)
+    digest = hashlib.sha256(source.read_bytes() + os.fsencode(install)).hexdigest()[:16]
+    binary = Path("/tmp") / f"na6p_cluster_truth_reader_{digest}"
+    lock_path = binary.with_suffix(".lock")
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if not binary.exists():
+            root_flags = subprocess.check_output(["root-config", "--cflags", "--libs"], text=True).split()
+            temporary_binary = binary.with_name(binary.name + f".{os.getpid()}.tmp")
+            command = [
+                "g++", "-std=c++17", "-O2", str(source),
+                f"-I{install / 'include'}", f"-L{install / 'lib'}", "-lbaseLib",
+                "-o", str(temporary_binary), *root_flags,
+            ]
+            subprocess.run(command, check=True)
+            os.replace(temporary_binary, binary)
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    result = subprocess.run(
+        [str(binary), str(tree_path), tree_name, truth_branch],
+        check=True, capture_output=True, text=True,
+    )
+    lines = iter(result.stdout.splitlines())
+    event_layers = []
+    event_labels = []
+    for event_index, line in enumerate(lines):
+        nclusters = int(line)
+        layers_by_particle: dict[int, set[int]] = {}
+        cluster_labels = []
+        for cluster_index in range(nclusters):
+            fields = next(lines).split()
+            nlabels = int(fields[0])
+            labels = tuple(int(value) for value in fields[1:1 + nlabels])
+            if include_labels:
+                cluster_labels.append(labels)
+            for raw_label in labels:
+                particle_id = _label_track_id(raw_label)
+                if particle_id is not None:
+                    layers_by_particle.setdefault(particle_id, set()).add(
+                        int(detector_ids[event_index][cluster_index])
+                    )
+        event_layers.append(layers_by_particle)
+        if include_labels:
+            event_labels.append(cluster_labels)
+    return event_layers, event_labels
+
+
+def _cluster_truth_layers(
+    tree_path: Path,
+    tree_name: str,
+    truth_branch: str,
+    detector_ids: np.ndarray,
+) -> list[dict[int, set[int]]]:
+    """Return the particle IDs and detector layers from cluster truth."""
+    return _cluster_truth_data(tree_path, tree_name, truth_branch, detector_ids)[0]
 
 
 def _mc_events(tree_path: Path, n_events: int):
@@ -140,22 +191,6 @@ def _mc_events(tree_path: Path, n_events: int):
         raise RuntimeError(f"MC particle reader failed: {stderr.strip()}")
 
 
-def _reco_kinematics(params: np.ndarray) -> dict[str, float] | None:
-    """Compute a MuonSpec track's p, pT, and y from its fitted parameters."""
-    tx, ty, q_over_pxz = map(float, params[2:5])
-    if not np.isfinite([tx, ty, q_over_pxz]).all() or q_over_pxz == 0 or abs(tx) > 1:
-        return None
-    pxz = 1.0 / abs(q_over_pxz)  # muon charge has unit magnitude
-    px, py = tx * pxz, ty * pxz
-    pz = np.sqrt(1.0 - tx * tx) * pxz
-    pt = float(np.hypot(px, py))
-    return {
-        "p": float(np.hypot(pt, pz)),
-        "pt": pt,
-        "y": float(np.arcsinh(pz / np.hypot(pt, 0.1056583755))),
-    }
-
-
 def _save_binned_plots(output_path: Path, denominator: dict[str, list[float]],
                        numerator: dict[str, list[float]], filename: str,
                        ylabel: str) -> None:
@@ -167,7 +202,7 @@ def _save_binned_plots(output_path: Path, denominator: dict[str, list[float]],
     axes = {
         "p": ("p (GeV/c)", 0.0, 30.0),
         "pt": ("p_{T} (GeV/c)", 0.0, 3.0),
-        "y": ("y", 1.0, 7.0),
+        "y": ("y", 0.0, 7.0),
     }
     prefix = Path(filename).stem
     canvas = ROOT.TCanvas(f"c_{prefix}", ylabel, 1500, 500)
@@ -221,13 +256,13 @@ def _mean_bin_efficiency(output_path: Path, denominator: dict[str, list[float]],
     """Save the 2D efficiency (pt vs y) and return the unweighted mean over filled bins."""
     import ROOT
 
-    pt_range, y_range = (0.0, 3.0), (1.0, 7.0)
+    pt_range, y_range = (0.0, 3.0), (0.0, 7.0)
     hist_range = [pt_range, y_range]
     bins = [n_pt_bins, n_y_bins]
     den, _, _ = np.histogram2d(denominator["pt"], denominator["y"], bins=bins, range=hist_range)
     num, _, _ = np.histogram2d(numerator["pt"], numerator["y"], bins=bins, range=hist_range)
 
-    filled = den > 0  # bins without trackable muons carry no information
+    filled = den > 0  # bins without trackable particles carry no information
     eff = np.divide(num, den, out=np.zeros_like(den), where=filled)
 
     ROOT.gROOT.SetBatch(True)
@@ -250,111 +285,109 @@ def _mean_bin_efficiency(output_path: Path, denominator: dict[str, list[float]],
 
 
 def metric_function(output_dir: str) -> tuple[float, float]:
-    """Return MuonSpec efficiency and time per reconstructed track."""
+    """
+    Calculate the VerTel bin-averaged efficiency and time per reconstructed track.
+    Returns:
+        (efficiency to maximize, seconds per reconstructed track to minimize)
+    """
     output_path = Path(output_dir)
 
-    with uproot.open(output_path / "TracksMuonSpec.root") as f_tracks, \
-         uproot.open(output_path / "ClustersMuonSpec.root") as f_clusters:
-        tracks = f_tracks["tracksMuonSpec"]
-        clusters = f_clusters["clustersMuonSpec"]
-        n_clusters = tracks["MuonSpec/MuonSpec.mNClusters"].array(library="np")
+    # Open ROOT files
+    with uproot.open(output_path / "TracksVerTel.root") as f_tracks, \
+         uproot.open(output_path / "ClustersVerTel.root") as f_clusters:
+
+        tracks = f_tracks["tracksVerTel"]
+        clusters = f_clusters["clustersVerTel"]
+
+        # reconstructed tracks
+        n_clusters = tracks["VerTel/VerTel.mNClusters"].array(library="np")
+        # Track truth is now stored separately from NA6PTrack.  Do not use
+        # VerTel.mPID: that is the fitted particle hypothesis, not MC truth.
         track_labels = _array_from_first_available_branch(
             tracks,
-            ["MuonSpecMCTruth.mLabel", "MuonSpecMCTruth/MuonSpecMCTruth.mLabel"],
+            ["VerTelMCTruth.mLabel", "VerTelMCTruth/VerTelMCTruth.mLabel"],
         )
-        track_cluster_indices = tracks[
-            "MuonSpec/MuonSpec.mClusterIndices[16]"
-        ].array(library="np")
-        track_params = tracks["MuonSpec/MuonSpec.mP[5]"].array(library="np")
-        detector_ids = clusters["MuonSpec/MuonSpec.mLayer"].array(library="np")
+        track_params = tracks["VerTel/VerTel.mP[5]"].array(library="np")
+        # cluster info
+        detector_ids = clusters["VerTel/VerTel.mLayer"].array(library="np")
+        cluster_layers = _cluster_truth_layers(
+            output_path / "ClustersVerTel.root",
+            "clustersVerTel",
+            "VerTelMCTruth",
+            detector_ids,
+        )
 
-    cluster_layers, cluster_labels = _cluster_truth_data(
-        output_path / "ClustersMuonSpec.root",
-        "clustersMuonSpec",
-        "MuonSpecMCTruth",
-        detector_ids,
-        include_labels=True,
-    )
-
-    required_layers = set(range(
-        first_muonspec_layer, first_muonspec_layer + nclusters_threshold
-    ))
-    n_trackable = n_reconstructed = n_candidates = n_fake = 0
+    n_trackable = 0
+    n_reconstructed = 0
+    n_candidates = 0
+    n_fake = 0
+    n_events = len(n_clusters)
     trackable_kinematics = {name: [] for name in ("p", "pt", "y")}
     reconstructed_kinematics = {name: [] for name in ("p", "pt", "y")}
     candidate_kinematics = {name: [] for name in ("p", "pt", "y")}
     fake_kinematics = {name: [] for name in ("p", "pt", "y")}
-    n_events = len(n_clusters)
+
     logger.info("Total events: %s", n_events)
 
     with uproot.open(output_path / "MCKine.root") as f_kine:
-        kine = f_kine["mckine"]
-        if not (n_events == len(track_labels) == len(track_cluster_indices) == len(track_params)
-                == len(cluster_layers) == len(cluster_labels) == len(detector_ids)) or kine.num_entries < n_events:
-            raise ValueError("MuonSpec tracks, clusters, and MC events are misaligned")
+        if (len(track_labels) != n_events or len(track_params) != n_events
+                or len(cluster_layers) != n_events or len(detector_ids) != n_events
+                or f_kine["mckine"].num_entries < n_events):
+            raise ValueError("VerTel tracks, clusters, and MC events are misaligned")
 
-        for event_nclusters, event_labels, event_indices, event_params, event_layers, event_cluster_labels, event_detector_ids, particle_data in zip(
-            n_clusters, track_labels, track_cluster_indices, track_params, cluster_layers,
-            cluster_labels, detector_ids,
-            _mc_events(output_path / "MCKine.root", n_events),
-            strict=True,
+        for event_nclusters, event_track_labels, event_params, event_layers, particle_data in zip(
+            n_clusters, track_labels, track_params, cluster_layers,
+            _mc_events(output_path / "MCKine.root", n_events), strict=True,
         ):
-            qualifying = [
-                (raw_label, indices, int(ncl), params)
-                for raw_label, indices, ncl, params in zip(
-                    event_labels, event_indices, event_nclusters, event_params, strict=True,
-                )
-                if ncl >= nclusters_threshold
-                and _has_required_layers(indices, int(ncl), event_detector_ids, required_layers)
-            ]
-            main_ids = {
-                key & ((1 << 31) - 1)
-                for raw_label, _, _, _ in qualifying
-                if (key := _truth_key(raw_label)) is not None
-            }
-            pdg, mothers, momentum = particle_data
-            eligible_ids = eligible_muon_ids(pdg, mothers, accepted_mother_pdgs)
-            delta_by_mother = delta_electrons_by_mother(pdg, mothers, main_ids)
+            _, _, momentum = particle_data
 
-            reconstructed_truth_ids = set()
-            for raw_label, indices, ncl, params in qualifying:
-                n_candidates += 1
-                is_fake = _track_has_wrong_hit(
-                    raw_label, indices, ncl, event_cluster_labels, delta_by_mother,
-                )
+            qualifying = [
+                (raw_label, params)
+                for raw_label, ncl, params in zip(
+                    event_track_labels, event_nclusters, event_params, strict=True,
+                ) if ncl >= nclusters_threshold
+            ]
+            reconstructed_truth_ids = {
+                track_id for raw_label, _ in qualifying
+                if (track_id := _label_track_id(raw_label)) is not None
+            }
+            n_candidates += len(qualifying)
+            for raw_label, params in qualifying:
+                is_fake = _label_track_id(raw_label) is None
+                n_fake += is_fake
                 values = _reco_kinematics(params)
                 if values is not None:
                     append_kinematics(candidate_kinematics, values)
                     if is_fake:
                         append_kinematics(fake_kinematics, values)
-                if is_fake:
-                    n_fake += 1
-                else:
-                    reconstructed_truth_ids.add(
-                        _label_track_id(int(raw_label) & ~(1 << 63))
-                    )
 
+            # Count distinct detector layers, since one particle can leave
+            # multiple clusters in the same layer.
             trackable_ids = {
                 particle_id for particle_id, layers in event_layers.items()
-                if particle_id in eligible_ids and required_layers.issubset(layers)
+                if len(layers) >= nclusters_threshold
             }
+            if any(particle_id >= len(momentum) for particle_id in trackable_ids):
+                raise ValueError("VerTel cluster truth refers to a missing MC particle")
             matched_ids = reconstructed_truth_ids.intersection(trackable_ids)
             record_truth_kinematics(
                 trackable_ids, matched_ids, momentum,
                 trackable_kinematics, reconstructed_kinematics,
             )
+
             n_trackable += len(trackable_ids)
             n_reconstructed += len(matched_ids)
 
     _save_binned_plots(output_path, trackable_kinematics, reconstructed_kinematics,
-                       "muon_efficiency_vs_p_pt_y.png", "Efficiency")
+                       "particle_efficiency_vs_p_pt_y.png", "Efficiency")
     _save_binned_plots(output_path, candidate_kinematics, fake_kinematics,
                        "fake_track_fraction_vs_p_pt_y.png", "Fake track fraction")
     efficiency_global = n_reconstructed / n_trackable if n_trackable > 0 else 0.0
     efficiency = _mean_bin_efficiency(
         output_path, trackable_kinematics, reconstructed_kinematics,
-        "muon_efficiency_pt_vs_y.png",
+        "particle_efficiency_pt_vs_y.png",
     )
+
     time_seconds = cpu_seconds(output_path)
     time_per_track = time_seconds / n_reconstructed if n_reconstructed > 0 else 0.0
 
@@ -362,21 +395,25 @@ def metric_function(output_dir: str) -> tuple[float, float]:
 
     logger.info(
         "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
-        n_reconstructed, n_trackable, n_fake, n_candidates,
+        n_reconstructed,
+        n_trackable,
+        n_fake,
+        n_candidates,
     )
     logger.info(
         "Efficiency (bin-averaged): %.4f, global: %.4f, Time/event: %.6fs, Time/track: %.6fs",
-        efficiency, efficiency_global,
-        time_per_event, time_per_track,
+        efficiency,
+        efficiency_global,
+        time_per_event,
+        time_per_track,
     )
-    with open(output_path / "metrics.txt", "w") as metrics_file:
-        metrics_file.write(
-            f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}, "
-            f"Fake: {n_fake}, Candidates: {n_candidates}\n"
-        )
-        metrics_file.write(
-            f"Efficiency: {efficiency:.4f}, Efficiency (global): {efficiency_global:.4f}, "
-            f"Time/event: {time_per_event:.6f}s, "
-            f"Time/track: {time_per_track:.6f}s\n"
-        )
+
+    metrics_file = output_path / "metrics.txt"
+    with open(metrics_file, "w") as f:
+        f.write(f"Reconstructed: {n_reconstructed}, Trackable: {n_trackable}, "
+                f"Fake: {n_fake}, Candidates: {n_candidates}\n")
+        f.write(f"Efficiency: {efficiency:.4f}, Efficiency (global): {efficiency_global:.4f}, "
+                f"Time/event: {time_per_event:.6f}s, "
+                f"Time/track: {time_per_track:.6f}s\n")
+
     return efficiency, time_per_track

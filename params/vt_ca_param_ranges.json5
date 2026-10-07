@@ -1,8 +1,7 @@
 {
-  "objective": ["maximize"],
   "reco_options": {
     "doHitsToRecPoints": true,
-    "doDigitsToRecPoints": true,
+    "doDigitsToRecPoints": false,
     "doTrackletVertex": false,
     "doVTTracking": true,
     "allowHolesInVTTracks": true,
@@ -10,74 +9,73 @@
     "doMatching": false
   },
   "simulation_options": {
-    //"generator": "${NA6PROOT_ROOT}/share/test/genHEPMC.C+(\"/data/galocco/TheFIST_PbPb_8.77GeV_NA6PRoot/job_1/output.PbPb.8.77.C0-5.root\")",
-    "generator": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C+(1,\"Omega\")",
+    "generator": "$NA6PROOT_ROOT/share/test/genStrangenessBgEvent.C()"
   },
   "parameters": {
     "vtNIterationsTrackerCA": {
       "min": 2,
-      "max": 6,
+      "max": 4,
       "type": "int"
     },
     "vtMaxDeltaThetaTrackletsCA": {
-      "min": 0,
-      "max": 0.05,
+      "min": 0.,
+      "max": 0.06,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
-      "monotone_increasing": true
+      "monotone_increasing": true 
     },
     "vtMaxDeltaPhiTrackletsCA": {
-      "min": 0,
-      "max": 2,
+      "min": 0.,
+      "max": 0.25,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxDeltaTanLCellsCA": {
       "min": 0,
-      "max": 50.0,
+      "max": 50,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxDeltaPhiCellsCA": {
       "min": 0,
-      "max": 2,
+      "max": 0.6,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxDeltaPxPzCellsCA": {
       "min": 0,
-      "max": 0.2,
+      "max": 0.5,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxDeltaPyPzCellsCA": {
-      "min": 0,
-      "max": 0.05,
+      "min": 0.0,
+      "max": 0.01,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxChi2TrClCellsCA": {
       "min": 0,
-      "max": 20,
+      "max": 50,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxChi2ndfCellsCA": {
       "min": 0,
-      "max": 20,
+      "max": 30,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 
     },
     "vtMaxChi2ndfTracksCA": {
       "min": 0,
-      "max": 20,
+      "max": 30,
       "type": "float",
       "iterations_param": "vtNIterationsTrackerCA",
       "monotone_increasing": true 

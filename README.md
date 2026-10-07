@@ -40,6 +40,7 @@ This framework automates the process of finding optimal reconstruction parameter
 ```bash
 pip install -r requirements.txt
 ```
+
 ---
 
 ## Quick Start
@@ -56,13 +57,20 @@ Create a `metric.py` file (or point to your custom metric module with `--metric-
 
 ```python
 # metric.py
+OBJECTIVE_DIRECTIONS = ("maximize",)
+OBJECTIVE_NAMES = ("reconstruction quality",)
+
 def metric_function(output_dir: str) -> float:
     """Calculate reconstruction quality metric."""
     # Read output files from output_dir
     # Calculate metric (e.g., chi2, efficiency, resolution)
-    # Return value to maximize or minimize according to the json
+    # Return values in the same order as OBJECTIVE_DIRECTIONS and OBJECTIVE_NAMES
     return metric_value
 ```
+
+For multiple objectives, list one direction and name for each value returned by
+`metric_function`, in the same order. The optimizer reads these declarations from
+the metric module when creating the Optuna study and labeling Pareto plots.
 
 ### 3. Define Parameters to Optimize
 

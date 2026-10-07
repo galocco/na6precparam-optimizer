@@ -1,0 +1,22 @@
+{
+  "reco_options": {
+    "doHitsToRecPoints": true,
+    "doDigitsToRecPoints": false,
+    "doTrackletVertex": false,
+    "doVTTracking": false,
+    "allowHolesInVTTracks": false,
+    "doMSTracking": true,
+    "doMatching": false
+  },
+  "simulation_options": {
+    "generator": "$NA6PROOT_ROOT/share/test/genDimuonBgEvent.C(1,\"Omega\")",
+    "hook": "/home/galocco/NA6PRoot/test/testHooks.C",
+  },
+  "parameters": {
+    "msZForMSMIDmatch": {
+      "min": 790,
+      "max": 850,
+      "type": "float"
+    }
+  }
+}

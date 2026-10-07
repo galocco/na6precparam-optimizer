@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore", message=".*is experimental.*")
 
 import argparse
 import importlib.util
+from itertools import combinations
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from typing import Any, Callable, Dict
 import matplotlib.pyplot as plt
 
 import optuna
-from optuna.trial import Trial
+from optuna.trial import Trial, TrialState
 
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,8 @@ def setup_logging(
     root_logger.addHandler(console_handler)
 
 
-def load_metric_function(module_path: str) -> Callable[[str], float]:
-    """Dynamically load a metric function from a Python module."""
+def load_metric_function(module_path: str) -> tuple[Callable, tuple[str, ...], tuple[str, ...]]:
+    """Load a metric and its ordered objective metadata from a Python module."""
     path = Path(module_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Metric module not found: {path}")
@@ -77,7 +78,19 @@ def load_metric_function(module_path: str) -> Callable[[str], float]:
     if not callable(func):
         raise TypeError(f"'metric_function' in {path} must be callable")
 
-    return func
+    directions = getattr(module, "OBJECTIVE_DIRECTIONS", None)
+    names = getattr(module, "OBJECTIVE_NAMES", None)
+    if (
+        not isinstance(directions, (tuple, list)) or not directions
+        or any(direction not in ("maximize", "minimize") for direction in directions)
+        or not isinstance(names, (tuple, list)) or len(names) != len(directions)
+        or any(not isinstance(name, str) or not name.strip() for name in names)
+    ):
+        raise ValueError(
+            f"{path}: OBJECTIVE_DIRECTIONS must contain 'maximize' or 'minimize'; "
+            "OBJECTIVE_NAMES must contain one nonempty name per direction"
+        )
+    return func, tuple(directions), tuple(names)
 
 
 def load_param_ranges(config_path: str) -> Dict[str, Any]:
@@ -140,11 +153,6 @@ def load_param_ranges(config_path: str) -> Dict[str, Any]:
             "The 'simulation_options' (or 'sim_options') section must be a JSON object"
         )
     normalized["simulation_options"] = simulation_options
-
-    objectives = data.get("objective", ["maximize"])
-    if isinstance(objectives, str):
-        objectives = [objectives]
-    normalized["objectives"] = objectives
 
     return normalized
 
@@ -212,6 +220,7 @@ class INIParameterOptimizer:
         simulation_options: Dict[str, Any] = None,
         n_jobs: int = 1,
         save: bool = False,
+        objective_directions: tuple[str, ...] = ("maximize",),
     ):
         self.layout_ini = Path(layout_ini).expanduser().resolve() if layout_ini else None
         self.reco_ini_template = (
@@ -219,6 +228,7 @@ class INIParameterOptimizer:
             if reco_ini_template else None
         )
         self.metric_function = metric_function
+        self.objective_directions = objective_directions
         self.n_events = n_events
         resolved_work_dir = DEFAULT_RESULTS_DIR if work_dir is None else Path(work_dir).expanduser().resolve()
         self.work_dir = resolved_work_dir
@@ -627,6 +637,12 @@ class INIParameterOptimizer:
             with self._metric_lock:
                 metric_start = time.perf_counter()
                 metric = self.metric_function(str(trial_dir))
+                values = metric if isinstance(metric, (tuple, list)) else (metric,)
+                if len(values) != len(self.objective_directions):
+                    raise ValueError(
+                        f"Metric returned {len(values)} value(s), but declares "
+                        f"{len(self.objective_directions)} objective(s)"
+                    )
                 logger.info(
                     "Metric evaluation in %s completed in %.3fs (waited %.3fs)",
                     trial_dir, time.perf_counter() - metric_start,
@@ -861,9 +877,7 @@ def main():
     setup_logging(log_level=log_level)
 
     param_config = load_param_ranges(args.param_ranges)
-    objectives    = param_config.get("objectives", ["maximize"])
-
-    metric_func = load_metric_function(args.metric_module)
+    metric_func, objectives, obj_names = load_metric_function(args.metric_module)
 
     optimizer = INIParameterOptimizer(
         layout_ini=args.layout_ini,
@@ -875,6 +889,7 @@ def main():
         simulation_options=param_config.get("simulation_options", {}),
         n_jobs=args.n_jobs,
         save=args.save,
+        objective_directions=objectives,
     )
 
     study = optimizer.optimize(
@@ -895,8 +910,7 @@ def main():
     logger.info("OPTIMIZATION COMPLETE")
     logger.info("%s", "=" * 80)
 
-    is_multi = len(param_config.get("objectives", ["maximize"])) > 1
-    obj_names = param_config.get("objective_names", [f"obj_{i}" for i in range(len(param_config.get("objectives", ["maximize"])))])
+    is_multi = len(objectives) > 1
 
     if is_multi:
         pareto = study.best_trials
@@ -932,10 +946,101 @@ def main():
             ax = optuna.visualization.matplotlib.plot_pareto_front(
                 study, target_names=obj_names
             )
+            front = sorted((trial.values[0], trial.values[1]) for trial in pareto)
+            if len(front) > 1:
+                ax.plot(
+                    [x for x, _ in front],
+                    [y for _, y in front],
+                    color="tab:red",
+                    linewidth=1.5,
+                    label="Pareto front",
+                )
+                ax.legend()
             fig = ax.get_figure()
             fig.savefig(output_dir / "pareto_front.png", dpi=150, bbox_inches="tight")
             plt.close(fig)
             logger.info("Pareto front saved to: %s/pareto_front.png", output_dir)
+        elif len(obj_names) >= 3:
+            completed = study.get_trials(
+                deepcopy=False, states=(TrialState.COMPLETE,)
+            )
+            for indices in combinations(range(len(obj_names)), 3):
+                fig = plt.figure(figsize=(14, 10))
+                ax = fig.add_subplot(2, 2, 1, projection="3d")
+                ax.scatter(
+                    *([trial.values[i] for trial in completed] for i in indices),
+                    color="lightgray", alpha=0.6, label="Completed trials",
+                )
+                ax.scatter(
+                    *([trial.values[i] for trial in pareto] for i in indices),
+                    color="tab:blue", label="Pareto solutions",
+                )
+                ax.set_xlabel(obj_names[indices[0]])
+                ax.set_ylabel(obj_names[indices[1]])
+                ax.set_zlabel(obj_names[indices[2]])
+                ax.legend()
+
+                for panel, (x_index, y_index) in enumerate(combinations(indices, 2), 2):
+                    projection = fig.add_subplot(2, 2, panel)
+                    projection.scatter(
+                        [trial.values[x_index] for trial in completed],
+                        [trial.values[y_index] for trial in completed],
+                        color="lightgray", alpha=0.6,
+                    )
+                    front = sorted(
+                        (trial.values[x_index], trial.values[y_index])
+                        for trial in pareto
+                    )
+                    if len(front) > 1:
+                        projection.plot(
+                            [x for x, _ in front], [y for _, y in front],
+                            color="tab:red", linewidth=1.5,
+                        )
+                    projection.scatter(
+                        [x for x, _ in front], [y for _, y in front],
+                        color="tab:blue", zorder=3,
+                    )
+                    projection.set_xlabel(obj_names[x_index])
+                    projection.set_ylabel(obj_names[y_index])
+                    projection.grid(alpha=0.2)
+
+                fig.tight_layout()
+                filename = (
+                    "pareto_front_3d.png" if len(obj_names) == 3 else
+                    f"pareto_front_3d_{'_'.join(map(str, indices))}.png"
+                )
+                fig.savefig(output_dir / filename, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                logger.info("Pareto projection saved to: %s/%s", output_dir, filename)
+
+            for x_index, y_index in combinations(range(len(obj_names)), 2):
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.scatter(
+                    [trial.values[x_index] for trial in completed],
+                    [trial.values[y_index] for trial in completed],
+                    color="lightgray", alpha=0.6, label="Completed trials",
+                )
+                front = sorted(
+                    (trial.values[x_index], trial.values[y_index]) for trial in pareto
+                )
+                if len(front) > 1:
+                    ax.plot(
+                        [x for x, _ in front], [y for _, y in front],
+                        color="tab:red", linewidth=1.5,
+                        label="Projected Pareto set",
+                    )
+                ax.scatter(
+                    [x for x, _ in front], [y for _, y in front],
+                    color="tab:blue", zorder=3,
+                    label="Pareto solutions" if len(front) == 1 else None,
+                )
+                ax.set_xlabel(obj_names[x_index])
+                ax.set_ylabel(obj_names[y_index])
+                ax.legend()
+                filename = f"pareto_front_{x_index}_{y_index}.png"
+                fig.savefig(output_dir / filename, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                logger.info("Pareto projection saved to: %s/%s", output_dir, filename)
 
         for i, obj_name in enumerate(obj_names):
             target_fn = lambda t, i=i: t.values[i]

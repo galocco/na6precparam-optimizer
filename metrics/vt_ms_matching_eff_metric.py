@@ -4,92 +4,96 @@ import logging
 import sys
 from pathlib import Path
 
-import numpy as np
 import uproot
 
 sys.path.insert(0, str(Path(__file__).parent))
-from vt_eff_time_metric import (  # noqa: E402
+from vt_multiobjective_metric_function import (  # noqa: E402
     _array_from_first_available_branch,
-    _cluster_truth_layers,
     _label_track_id,
 )
 
 nclusters_threshold_vt = 4
 nclusters_threshold_ms = 4
 nclusters_threshold_mt = nclusters_threshold_vt + nclusters_threshold_ms
+OBJECTIVE_DIRECTIONS = ("maximize",)
+OBJECTIVE_NAMES = ("matching efficiency",)
 logger = logging.getLogger("metrics.vt_ms_matching_eff_metric")
 
 
+def _track_ids(labels, cluster_counts, minimum_clusters: int) -> set[int]:
+    """Return truth IDs with a reconstructed track above the cluster threshold."""
+    return {
+        particle_id
+        for label, count in zip(labels, cluster_counts, strict=True)
+        if count >= minimum_clusters
+        if (particle_id := _label_track_id(label)) is not None
+    }
+
+
 def metric_function(output_dir: str) -> float:
-    """Return matching efficiency, with trackability based on truth layers."""
+    """Measure matching among particles with tracks in both detectors."""
     output_path = Path(output_dir)
 
-    with uproot.open(output_path / "TracksMatching.root") as f_tracks, \
-         uproot.open(output_path / "ClustersVerTel.root") as f_clusters_vt, \
-         uproot.open(output_path / "ClustersMuonSpec.root") as f_clusters_ms:
-        tracks = f_tracks["tracksMatching"]
-        clusters_vt = f_clusters_vt["clustersVerTel"]
-        clusters_ms = f_clusters_ms["clustersMuonSpec"]
+    with uproot.open(output_path / "TracksMatching.root") as matching_file, \
+         uproot.open(output_path / "TracksVerTel.root") as vt_file, \
+         uproot.open(output_path / "TracksMuonSpec.root") as ms_file:
+        matching_tracks = matching_file["tracksMatching"]
+        vt_tracks = vt_file["tracksVerTel"]
+        ms_tracks = ms_file["tracksMuonSpec"]
 
-        n_clusters = tracks["Matching/Matching.mNClusters"].array(library="np")
-        track_labels = _array_from_first_available_branch(
-            tracks,
+        matching_cluster_counts = matching_tracks[
+            "Matching/Matching.mNClusters"
+        ].array(library="np")
+        matching_labels = _array_from_first_available_branch(
+            matching_tracks,
             ["MatchingMCTruth.mLabel", "MatchingMCTruth/MatchingMCTruth.mLabel"],
         )
-        detector_ids_vt = clusters_vt["VerTel/VerTel.mLayer"].array(library="np")
-        detector_ids_ms = clusters_ms["MuonSpec/MuonSpec.mLayer"].array(library="np")
+        vt_cluster_counts = vt_tracks["VerTel/VerTel.mNClusters"].array(library="np")
+        vt_labels = _array_from_first_available_branch(
+            vt_tracks, ["VerTelMCTruth.mLabel", "VerTelMCTruth/VerTelMCTruth.mLabel"],
+        )
+        ms_cluster_counts = ms_tracks["MuonSpec/MuonSpec.mNClusters"].array(library="np")
+        ms_labels = _array_from_first_available_branch(
+            ms_tracks, ["MuonSpecMCTruth.mLabel", "MuonSpecMCTruth/MuonSpecMCTruth.mLabel"],
+        )
 
-    vt_layers = _cluster_truth_layers(
-        output_path / "ClustersVerTel.root",
-        "clustersVerTel",
-        "VerTelMCTruth",
-        detector_ids_vt,
-    )
-    ms_layers = _cluster_truth_layers(
-        output_path / "ClustersMuonSpec.root",
-        "clustersMuonSpec",
-        "MuonSpecMCTruth",
-        detector_ids_ms,
-    )
-
-    n_trackable = 0
+    n_matchable = 0
     n_reconstructed = 0
     n_candidates = 0
     n_fake = 0
-    n_events = len(n_clusters)
+    n_events = len(matching_cluster_counts)
+    if not all(len(events) == n_events for events in (
+        matching_labels, vt_cluster_counts, vt_labels, ms_cluster_counts, ms_labels,
+    )):
+        raise ValueError("Matching, VT, and MuonSpec track events are misaligned")
 
-    for event_nclusters, event_labels, event_vt_layers, event_ms_layers in zip(
-        n_clusters, track_labels, vt_layers, ms_layers
+    for matching_counts, event_matching_labels, vt_counts, event_vt_labels, ms_counts, event_ms_labels in zip(
+        matching_cluster_counts, matching_labels,
+        vt_cluster_counts, vt_labels, ms_cluster_counts, ms_labels,
+        strict=True,
     ):
-        qualifying_labels = [
-            raw_label for raw_label, ncl in zip(event_labels, event_nclusters)
+        selected_labels = [
+            raw_label for raw_label, ncl in zip(event_matching_labels, matching_counts, strict=True)
             if ncl >= nclusters_threshold_mt
         ]
-        candidate_ids = {
-            particle_id for raw_label in qualifying_labels
-            if (particle_id := _label_track_id(raw_label)) is not None
-        }
-        n_candidates += len(qualifying_labels)
-        n_fake += sum(_label_track_id(label) is None for label in qualifying_labels)
+        candidate_ids = _track_ids(
+            event_matching_labels, matching_counts, nclusters_threshold_mt,
+        )
+        n_candidates += len(selected_labels)
+        n_fake += sum(_label_track_id(label) is None for label in selected_labels)
 
-        vt_trackable = {
-            particle_id for particle_id, layers in event_vt_layers.items()
-            if len(layers) >= nclusters_threshold_vt
-        }
-        ms_trackable = {
-            particle_id for particle_id, layers in event_ms_layers.items()
-            if len(layers) >= nclusters_threshold_ms
-        }
-        trackable_ids = vt_trackable.intersection(ms_trackable)
+        vt_track_ids = _track_ids(event_vt_labels, vt_counts, nclusters_threshold_vt)
+        ms_track_ids = _track_ids(event_ms_labels, ms_counts, nclusters_threshold_ms)
+        matchable_ids = vt_track_ids & ms_track_ids
 
-        n_trackable += len(trackable_ids)
-        n_reconstructed += len(candidate_ids.intersection(trackable_ids))
+        n_matchable += len(matchable_ids)
+        n_reconstructed += len(candidate_ids & matchable_ids)
 
-    efficiency = n_reconstructed / n_trackable if n_trackable > 0 else 0.0
+    efficiency = n_reconstructed / n_matchable if n_matchable > 0 else 0.0
     logger.info(
-        "Reconstructed: %s, Trackable: %s, Fake: %s, Candidates: %s",
+        "Matched: %s, Matchable: %s, Fake: %s, Candidates: %s",
         n_reconstructed,
-        n_trackable,
+        n_matchable,
         n_fake,
         n_candidates,
     )
